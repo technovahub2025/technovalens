@@ -11,6 +11,7 @@ import fs from "fs";
 import path from "path";
 import { answerLocally, buildCompactSheetContext, hashWorkbook, normalizeQuestion } from "./analytics.js";
 import { answerPdfLocally, localLimitation } from "./local-document.js";
+import { connectDB } from "./config/db.js";
 import { JsonConversationStore } from "./storage/json-conversation-store.js";
 
 // Resolve the backend .env from this file, regardless of the directory used to start Node.
@@ -28,9 +29,31 @@ console.info("Gemini configuration:", {
   fallbackModelConfigured: Boolean(FALLBACK_GEMINI_MODEL),
   envFileLoaded: !envResult.error
 });
+
 const app = express();
-app.use(cors({ origin: "http://localhost:5173" }));
+
+const allowedOrigins = [
+  "http://localhost:5173",
+  "https://technovalens.vercel.app"
+];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error(`Not allowed by CORS: ${origin}`));
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
+app.options(/.*/, cors());
+
 app.use(express.json({ limit: "2mb" }));
+
 const MAX_UPLOAD = 20 * 1024 * 1024;
 const acceptedMimeTypes = {
   pdf: new Set(["application/pdf"]),
@@ -61,7 +84,7 @@ const documentStorePath = process.env.DOCUMENT_STORE_DIR
   : fileURLToPath(new URL("./.data/uploads/", import.meta.url));
 fs.mkdirSync(documentStorePath, { recursive: true });
 const DATA_DIR = path.dirname(documentStorePath.replace(/[\\/]$/, ""));
-const conversationStore = new JsonConversationStore(DATA_DIR);
+let conversationStore;
 const CACHE_PATH = path.join(DATA_DIR, "analysis-cache.json");
 const USAGE_PATH = path.join(DATA_DIR, "gemini-usage.json");
 const PROMPT_VERSION = "2026-11-05-v2";
@@ -84,11 +107,7 @@ for (const entry of fs.readdirSync(documentStorePath, { withFileTypes: true })) 
 }
 const backendInstanceId = crypto.randomUUID();
 console.info("Uploaded document store ready:", { backendInstanceId, mapSize: documents.size, store: documentStorePath });
-for (const document of documents.values()) {
-  if (!conversationStore.list().some(conversation => conversation.fileId === document.fileId)) {
-    conversationStore.create(document.fileId, document.name);
-  }
-}
+
 function getDocument(fileId, { reload = false } = {}) {
   let document = reload ? null : documents.get(fileId);
   if ((!document || reload) && typeof fileId === "string") {
@@ -453,7 +472,10 @@ async function receiveFile(req, res) {
     fs.writeFileSync(temporaryPath, JSON.stringify(record), { encoding: "utf8", mode: 0o600 });
     fs.renameSync(temporaryPath, persistedPath);
     documents.set(fileId, record);
-    const conversation = conversationStore.create(fileId, req.file.originalname);
+    const conversation = await conversationStore.create(
+  fileId,
+  req.file.originalname
+);
     response.conversationId = conversation.id;
     console.info("Uploaded document stored:", { backendInstanceId, fileId, mapSize: documents.size, kind: record.kind });
     res.json(response);
@@ -485,13 +507,105 @@ app.get("/api/files/:id", (req, res) => {
   if (!document) return res.status(404).json({ error: "Uploaded file not found." });
   res.json(describeDocument(document));
 });
-app.get("/api/conversations", (_req, res) => res.json(conversationStore.list().filter(item => documents.has(item.fileId))));
-app.post("/api/conversations", (req, res) => {
-  const fileId = req.body?.fileId;
-  const document = getDocument(fileId);
-  if (!document) return res.status(404).json({ error: "Uploaded file not found." });
-  res.status(201).json(conversationStore.create(fileId, req.body?.title || document.name));
+
+app.get("/api/conversations", async (_req, res) => {
+  try {
+    const conversations = await conversationStore.list();
+    res.json(conversations.filter(item => documents.has(item.fileId)));
+  } catch (error) {
+    console.error("Conversation list error:", error);
+    res.status(500).json({ error: "Could not load conversations." });
+  }
 });
+
+app.post("/api/conversations", async (req, res) => {
+  try {
+    const fileId = req.body?.fileId;
+    const document = getDocument(fileId);
+
+    if (!document) {
+      return res.status(404).json({ error: "Uploaded file not found." });
+    }
+
+    const conversation = await conversationStore.create(
+      fileId,
+      req.body?.title || document.name
+    );
+
+    res.status(201).json(conversation);
+  } catch (error) {
+    console.error("Conversation creation error:", error);
+    res.status(500).json({ error: "Could not create conversation." });
+  }
+});
+
+app.get("/api/conversations/:id", async (req, res) => {
+  try {
+    const conversation = await conversationStore.get(req.params.id);
+
+    if (!conversation || !getDocument(conversation.fileId)) {
+      return res.status(404).json({ error: "Conversation not found." });
+    }
+
+    res.json(conversation);
+  } catch (error) {
+    console.error("Conversation retrieval error:", error);
+    res.status(500).json({ error: "Could not load conversation." });
+  }
+});
+
+app.post("/api/conversations/:id/messages", async (req, res) => {
+  try {
+    const conversation = await conversationStore.get(req.params.id);
+
+    if (!conversation || !getDocument(conversation.fileId)) {
+      return res.status(404).json({ error: "Conversation not found." });
+    }
+
+    const { role, text } = req.body || {};
+
+    if (
+      !["user", "assistant"].includes(role) ||
+      typeof text !== "string" ||
+      !text.trim() ||
+      text.length > 30000
+    ) {
+      return res.status(400).json({
+        error: "A valid user or assistant message is required (up to 30,000 characters)."
+      });
+    }
+
+    const message = await conversationStore.append(
+      req.params.id,
+      { ...req.body, role, text: text.trim() }
+    );
+
+    if (!message) {
+      return res.status(404).json({ error: "Conversation not found." });
+    }
+
+    res.status(201).json(message);
+  } catch (error) {
+    console.error("Conversation message error:", error);
+    res.status(500).json({ error: "Could not save conversation message." });
+  }
+});
+
+app.delete("/api/conversations/:id", async (req, res) => {
+  try {
+    const deleted = await conversationStore.delete(req.params.id);
+
+    if (!deleted) {
+      return res.status(404).json({ error: "Conversation not found." });
+    }
+
+    res.json({ status: "removed" });
+  } catch (error) {
+    console.error("Conversation deletion error:", error);
+    res.status(500).json({ error: "Could not delete conversation." });
+  }
+});
+
 app.get("/api/conversations/:id", (req, res) => {
   const conversation = conversationStore.get(req.params.id);
   if (!conversation || !getDocument(conversation.fileId)) return res.status(404).json({ error: "Conversation not found." });
@@ -516,7 +630,7 @@ app.get("/api/excel/:id/preview", (req, res) => {
   if (!doc || doc.kind !== "spreadsheet") return res.status(404).json({ error: "Workbook not found. Please upload it again." });
   res.json({ columns: doc.columns, preview: doc.rows.slice(0, 100), rowCount: doc.rows.length, sheetNames: doc.sheets.map(s => s.name) });
 });
-app.delete("/api/files/:id", (req, res) => {
+app.delete("/api/files/:id", async (req, res) => {
   const document = getDocument(req.params.id);
   if (!document) return res.status(404).json({ error: "Uploaded file not found." });
   try { fs.unlinkSync(path.join(documentStorePath, `${req.params.id}.json`)); }
@@ -527,7 +641,7 @@ app.delete("/api/files/:id", (req, res) => {
     }
   }
   documents.delete(req.params.id);
-  conversationStore.deleteForFile(req.params.id);
+  await conversationStore.deleteForFile(req.params.id);
   res.json({ status: "removed" });
 });
 const gemini = process.env.GEMINI_API_KEY?.trim()
@@ -1065,4 +1179,44 @@ if (!/^\d+$/.test(configuredPort) || !Number.isInteger(port) || port < 1 || port
   console.error(`Invalid PORT configuration: expected an integer from 1 to 65535, received ${JSON.stringify(configuredPort)}.`);
   process.exit(1);
 }
-app.listen(port, () => console.log(`TECHNOVALENS API running at http://localhost:${port}`));
+async function startServer() {
+  try {
+    // Connect to MongoDB first
+    await connectDB();
+
+    // Initialize MongoDB conversation storage
+    conversationStore = new JsonConversationStore(DATA_DIR);
+    await conversationStore.initialize();
+
+    // Recreate conversations for existing documents that don't have one
+    const existingConversations = await conversationStore.list();
+
+    for (const document of documents.values()) {
+      const exists = existingConversations.some(
+        conversation => conversation.fileId === document.fileId
+      );
+
+      if (!exists) {
+        await conversationStore.create(
+          document.fileId,
+          document.name
+        );
+      }
+    }
+
+    console.log("Conversation storage initialized successfully.");
+
+    // Start Express server
+    app.listen(port, () => {
+      console.log(
+        `TECHNOVALENS API running at http://localhost:${port}`
+      );
+    });
+
+  } catch (error) {
+    console.error("Failed to start TechnovaLens:", error);
+    process.exit(1);
+  }
+}
+
+startServer();
