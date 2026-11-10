@@ -175,6 +175,25 @@ test("Excel API caching, single-flight, 429/503 retries, local answers and persi
   try {
     mock.mode = "success"; mock.calls = 0; mock.maxActive = 0; mock.delayMs = 0;
     running = await startBackend({ dataDir, budget: 50 });
+    const productionOrigin = "https://technovalens.vercel.app";
+    for (const route of ["/api/files", "/api/conversations"]) {
+      const response = await fetch(`${running.base}${route}`, { headers: { Origin: productionOrigin } });
+      assert.equal(response.headers.get("access-control-allow-origin"), productionOrigin, `${route} should allow the production frontend`);
+    }
+    const preflight = await fetch(`${running.base}/api/files/upload`, {
+      method: "OPTIONS",
+      headers: {
+        Origin: productionOrigin,
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "content-type"
+      }
+    });
+    assert.equal(preflight.status, 204);
+    assert.equal(preflight.headers.get("access-control-allow-origin"), productionOrigin);
+    assert.match(preflight.headers.get("access-control-allow-methods") || "", /POST/);
+    const unauthorized = await fetch(`${running.base}/api/files`, { headers: { Origin: "https://evil.example" } });
+    assert.equal(unauthorized.headers.get("access-control-allow-origin"), null);
+
     const pdf = await uploadPdf(running.base);
     const pdfSummary = await (await ask(running.base, pdf.fileId, "Assess the competitive threats to this company over the next five years.")).json();
     assert.equal(pdfSummary.source, "gemini-primary");

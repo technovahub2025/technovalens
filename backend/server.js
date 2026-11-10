@@ -32,25 +32,27 @@ console.info("Gemini configuration:", {
 
 const app = express();
 
-const allowedOrigins = [
+const allowedOrigins = new Set([
   "http://localhost:5173",
   "https://technovalens.vercel.app"
-];
+]);
 
-app.use(cors({
+const corsOptions = {
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
+    if (!origin || allowedOrigins.has(origin)) {
       return callback(null, true);
     }
 
     return callback(new Error(`Not allowed by CORS: ${origin}`));
   },
-  credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
+  allowedHeaders: ["Content-Type", "Authorization"],
+  optionsSuccessStatus: 204
+};
 
-app.options(/.*/, cors());
+// Apply CORS once, before body parsing, API routes, and error handlers. The
+// cors middleware also answers OPTIONS preflight requests with these same rules.
+app.use(cors(corsOptions));
 
 app.use(express.json({ limit: "2mb" }));
 
