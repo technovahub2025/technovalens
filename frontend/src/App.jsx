@@ -18,7 +18,7 @@ import {
 // Production: VITE_API_URL=https://your-render-service.onrender.com
 // Development: Uses Vite's /api proxy.
 
-const API_BASE = (import.meta.env.VITE_API_URL || "").replace(/\/+$/, "");
+const API_BASE = (import.meta.env.DEV ? "" : import.meta.env.VITE_API_URL || "").replace(/\/+$/, "");
 const API = `${API_BASE}/api`;
 
 // =====================================================

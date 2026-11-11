@@ -17,6 +17,7 @@ const providerServer = createServer(async (req, res) => {
     return;
   }
   mock.calls++;
+  mock.lastApiKey = req.headers["x-goog-api-key"] || null;
   mock.lastModel = req.url?.match(/\/models\/([^:]+)/)?.[1]?.replace(/^models\//, "") || "unknown";
   mock.callsByModel[mock.lastModel] = (mock.callsByModel[mock.lastModel] || 0) + 1;
   mock.active++;
@@ -73,7 +74,7 @@ async function freePort() {
   return port;
 }
 
-async function startBackend({ dataDir, budget = 15, apiKey = "test-only-key" }) {
+async function startBackend({ dataDir, budget = 15, apiKey = " test-only-key " }) {
   const port = await freePort();
   const child = spawn(process.execPath, ["server.js"], {
     cwd: backendDir,
@@ -211,6 +212,7 @@ test("Excel API caching, single-flight, 429/503 retries, local answers and persi
     const pdf = await uploadResponse.json();
     const pdfSummary = await (await ask(running.base, pdf.fileId, "Assess the competitive threats to this company over the next five years.")).json();
     assert.equal(pdfSummary.source, "gemini-primary");
+    assert.equal(mock.lastApiKey, "test-only-key", "Gemini receives the trimmed API key");
     assert.match(pdfSummary.answer, /regional data/);
     let expectedProviderCalls = 1;
     const costRows = [["Type", "Revenue"], ...Array.from({ length: 100 }, (_, index) => [`ArchiveOnlyRecord${index}`, index])];

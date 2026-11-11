@@ -17,6 +17,7 @@ import { JsonConversationStore } from "./storage/json-conversation-store.js";
 // Resolve the backend .env from this file, regardless of the directory used to start Node.
 const envPath = fileURLToPath(new URL("./.env", import.meta.url));
 const envResult = dotenv.config({ path: envPath });
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim() || "";
 const PRIMARY_GEMINI_MODEL = process.env.PRIMARY_GEMINI_MODEL?.trim() || process.env.GEMINI_MODEL?.trim() || "gemini-flash-latest";
 const FALLBACK_GEMINI_MODEL = process.env.FALLBACK_GEMINI_MODEL?.trim() || "";
 const GEMINI_API_BASE_URL = process.env.GEMINI_API_BASE_URL?.trim();
@@ -24,11 +25,15 @@ if (envResult.error && envResult.error.code !== "ENOENT") {
   console.error("Could not load backend/.env:", envResult.error.message);
 }
 console.info("Gemini configuration:", {
-  apiKeyLoaded: Boolean(process.env.GEMINI_API_KEY?.trim()),
+  apiKeyConfigured: Boolean(GEMINI_API_KEY),
+  customApiBaseUrlConfigured: Boolean(GEMINI_API_BASE_URL),
   primaryModel: PRIMARY_GEMINI_MODEL,
   fallbackModelConfigured: Boolean(FALLBACK_GEMINI_MODEL),
   envFileLoaded: !envResult.error
 });
+if (GEMINI_API_BASE_URL) {
+  console.warn("GEMINI_API_BASE_URL is set; Gemini requests will use this custom endpoint instead of Google's default API endpoint.");
+}
 
 const app = express();
 
@@ -649,9 +654,9 @@ app.delete("/api/files/:id", async (req, res) => {
   await conversationStore.deleteForFile(req.params.id);
   res.json({ status: "removed" });
 });
-const gemini = process.env.GEMINI_API_KEY?.trim()
+const gemini = GEMINI_API_KEY
   ? new GoogleGenAI({
-      apiKey: process.env.GEMINI_API_KEY,
+      apiKey: GEMINI_API_KEY,
       httpOptions: {
         timeout: GEMINI_TIMEOUT_MS,
         retryOptions: { attempts: 1 },
@@ -1186,6 +1191,10 @@ if (!/^\d+$/.test(configuredPort) || !Number.isInteger(port) || port < 1 || port
 }
 async function startServer() {
   try {
+    if (!GEMINI_API_KEY) {
+      console.warn("GEMINI_API_KEY is not configured; Gemini-backed analysis is unavailable. Set it in the deployment environment to enable it.");
+    }
+
     // Connect to MongoDB first
     await connectDB();
 
