@@ -104,7 +104,7 @@ async function startBackend({ dataDir, budget = 15, apiKey = "test-only-key" }) 
   throw new Error("Backend did not start in time.");
 }
 
-async function uploadWorkbook(base, rows, extra = []) {
+async function uploadWorkbook(base, rows, extra = [], origin) {
   const workbook = new ExcelJS.Workbook();
   const sheet = workbook.addWorksheet("Sales");
   sheet.addRow(["Region", "Revenue"]);
@@ -115,7 +115,7 @@ async function uploadWorkbook(base, rows, extra = []) {
   }
   const form = new FormData();
   form.append("file", new Blob([await workbook.xlsx.writeBuffer()], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }), "sales.xlsx");
-  const response = await fetch(`${base}/api/files/upload`, { method: "POST", body: form });
+  const response = await fetch(`${base}/api/files/upload`, { method: "POST", headers: origin ? { Origin: origin } : {}, body: form });
   assert.equal(response.status, 200);
   return response.json();
 }
@@ -149,10 +149,10 @@ function makePdf(text) {
   return Buffer.from(output);
 }
 
-async function uploadPdf(base, text = "Quarterly revenue was 125 units and profit was 25 units.", filename = "quarterly.pdf") {
+async function uploadPdf(base, text = "Quarterly revenue was 125 units and profit was 25 units.", filename = "quarterly.pdf", origin) {
   const form = new FormData();
   form.append("file", new Blob([makePdf(text)], { type: "application/pdf" }), filename);
-  const response = await fetch(`${base}/api/files/upload`, { method: "POST", body: form });
+  const response = await fetch(`${base}/api/files/upload`, { method: "POST", headers: origin ? { Origin: origin } : {}, body: form });
   assert.equal(response.status, 200);
   return response.json();
 }
@@ -175,32 +175,46 @@ test("Excel API caching, single-flight, 429/503 retries, local answers and persi
   try {
     mock.mode = "success"; mock.calls = 0; mock.maxActive = 0; mock.delayMs = 0;
     running = await startBackend({ dataDir, budget: 50 });
-    const productionOrigin = "https://technovalens.vercel.app";
-    for (const route of ["/api/files", "/api/conversations"]) {
-      const response = await fetch(`${running.base}${route}`, { headers: { Origin: productionOrigin } });
-      assert.equal(response.headers.get("access-control-allow-origin"), productionOrigin, `${route} should allow the production frontend`);
+    const approvedOrigins = [
+      "http://localhost:5173",
+      "https://technovalens.vercel.app",
+      "https://technovahub.in",
+      "https://www.technovahub.in"
+    ];
+    for (const origin of approvedOrigins) {
+      const response = await fetch(`${running.base}/api/health`, { headers: { Origin: origin } });
+      assert.equal(response.headers.get("access-control-allow-origin"), origin, `${origin} should be allowed`);
+      assert.equal(response.headers.get("access-control-allow-credentials"), "true");
     }
     const preflight = await fetch(`${running.base}/api/files/upload`, {
       method: "OPTIONS",
       headers: {
-        Origin: productionOrigin,
+        Origin: "https://technovahub.in",
         "Access-Control-Request-Method": "POST",
-        "Access-Control-Request-Headers": "content-type"
+        "Access-Control-Request-Headers": "content-type,authorization"
       }
     });
     assert.equal(preflight.status, 204);
-    assert.equal(preflight.headers.get("access-control-allow-origin"), productionOrigin);
-    assert.match(preflight.headers.get("access-control-allow-methods") || "", /POST/);
+    assert.equal(preflight.headers.get("access-control-allow-origin"), "https://technovahub.in");
+    assert.equal(preflight.headers.get("access-control-allow-credentials"), "true");
+    assert.match(preflight.headers.get("access-control-allow-methods") || "", /GET.*POST.*PUT.*PATCH.*DELETE.*OPTIONS/);
+    assert.match(preflight.headers.get("access-control-allow-headers") || "", /Content-Type/i);
+    assert.match(preflight.headers.get("access-control-allow-headers") || "", /Authorization/i);
     const unauthorized = await fetch(`${running.base}/api/files`, { headers: { Origin: "https://evil.example" } });
     assert.equal(unauthorized.headers.get("access-control-allow-origin"), null);
 
-    const pdf = await uploadPdf(running.base);
+    const pdfForm = new FormData();
+    pdfForm.append("file", new Blob([makePdf("Quarterly revenue was 125 units and profit was 25 units.")], { type: "application/pdf" }), "quarterly.pdf");
+    const uploadResponse = await fetch(`${running.base}/api/files/upload`, { method: "POST", headers: { Origin: "https://technovahub.in" }, body: pdfForm });
+    assert.equal(uploadResponse.status, 200);
+    assert.equal(uploadResponse.headers.get("access-control-allow-origin"), "https://technovahub.in");
+    const pdf = await uploadResponse.json();
     const pdfSummary = await (await ask(running.base, pdf.fileId, "Assess the competitive threats to this company over the next five years.")).json();
     assert.equal(pdfSummary.source, "gemini-primary");
     assert.match(pdfSummary.answer, /regional data/);
     let expectedProviderCalls = 1;
     const costRows = [["Type", "Revenue"], ...Array.from({ length: 100 }, (_, index) => [`ArchiveOnlyRecord${index}`, index])];
-    const first = await uploadWorkbook(running.base, [["North", 125], ["South", 90]], [["Costs", costRows]]);
+    const first = await uploadWorkbook(running.base, [["North", 125], ["South", 90]], [["Costs", costRows]], "https://www.technovahub.in");
     assert.equal(first.sheetNames.length, 2);
 
     const local = await (await ask(running.base, first.fileId, "What is the total Revenue?")).json();

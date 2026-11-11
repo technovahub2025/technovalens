@@ -34,7 +34,9 @@ const app = express();
 
 const allowedOrigins = new Set([
   "http://localhost:5173",
-  "https://technovalens.vercel.app"
+  "https://technovalens.vercel.app",
+  "https://technovahub.in",
+  "https://www.technovahub.in"
 ]);
 
 const corsOptions = {
@@ -45,6 +47,7 @@ const corsOptions = {
 
     return callback(new Error(`Not allowed by CORS: ${origin}`));
   },
+  credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   optionsSuccessStatus: 204
