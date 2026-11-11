@@ -20,6 +20,7 @@ import {
 
 const API_BASE = (import.meta.env.DEV ? "" : import.meta.env.VITE_API_URL || "").replace(/\/+$/, "");
 const API = `${API_BASE}/api`;
+const MAX_UPLOAD_SIZE = 50 * 1024 * 1024;
 
 // =====================================================
 // SAFE ERROR HANDLING
@@ -395,6 +396,11 @@ export default function App() {
 
     if (!["pdf", "xlsx", "csv"].includes(extension)) {
       setNotice("Choose a PDF, XLSX or CSV file.");
+      return;
+    }
+
+    if (selected.size > MAX_UPLOAD_SIZE) {
+      setNotice("File exceeds the 50 MB upload limit. Choose a smaller PDF, XLSX or CSV file.");
       return;
     }
 
@@ -1325,7 +1331,7 @@ export default function App() {
 
                 <b>Drop a file here to upload</b>
 
-                <p>PDF, XLSX or CSV · up to 20 MB</p>
+                <p>PDF, XLSX or CSV · up to 50 MB</p>
 
                 <button
                   type="button"

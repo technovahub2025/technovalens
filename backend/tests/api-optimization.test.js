@@ -168,6 +168,38 @@ async function stopBackend(child) {
   await Promise.race([once(child, "exit"), new Promise(resolve => setTimeout(resolve, 3000))]);
 }
 
+test("CSV uploads process below 50 MiB and reject files above the limit", { timeout: 60000 }, async () => {
+  providerServer.listen(0, "127.0.0.1");
+  await once(providerServer, "listening");
+  const dataDir = await mkdtemp(path.join(os.tmpdir(), "technovalens-upload-limit-"));
+  let running;
+  try {
+    running = await startBackend({ dataDir, budget: 1, apiKey: "" });
+
+    const csvContents = `Region,Revenue\n${"North,125\nSouth,90\n".repeat(30000)}`;
+    const validForm = new FormData();
+    validForm.append("file", new Blob([csvContents], { type: "text/csv" }), "regional-sales.csv");
+    const validResponse = await fetch(`${running.base}/api/files/upload`, { method: "POST", body: validForm });
+    assert.equal(validResponse.status, 200);
+    const uploadedCsv = await validResponse.json();
+    assert.equal(uploadedCsv.kind, "spreadsheet");
+    assert.ok(uploadedCsv.size < 50 * 1024 * 1024);
+    assert.ok(uploadedCsv.sheetNames.includes("CSV data"));
+
+    const oversized = Buffer.alloc(50 * 1024 * 1024 + 1, 0x61);
+    const oversizedForm = new FormData();
+    oversizedForm.append("file", new Blob([oversized], { type: "text/csv" }), "oversized.csv");
+    const rejectedResponse = await fetch(`${running.base}/api/files/upload`, { method: "POST", body: oversizedForm });
+    assert.equal(rejectedResponse.status, 413);
+    assert.match((await rejectedResponse.json()).error, /50 MB upload limit/);
+    assert.equal((await fetch(`${running.base}/api/health`)).status, 200, "oversized upload must not crash the backend");
+  } finally {
+    if (running) await stopBackend(running.child);
+    await new Promise(resolve => providerServer.close(resolve));
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test("Excel API caching, single-flight, 429/503 retries, local answers and persistent usage", { timeout: 120000 }, async t => {
   providerServer.listen(0, "127.0.0.1");
   await once(providerServer, "listening");

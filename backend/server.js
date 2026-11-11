@@ -64,7 +64,7 @@ app.use(cors(corsOptions));
 
 app.use(express.json({ limit: "2mb" }));
 
-const MAX_UPLOAD = 20 * 1024 * 1024;
+const MAX_UPLOAD = 50 * 1024 * 1024;
 const acceptedMimeTypes = {
   pdf: new Set(["application/pdf"]),
   xlsx: new Set(["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]),
@@ -1169,18 +1169,18 @@ app.post("/api/ai/ask/progress", async (req, res) => {
 });
 app.use((err, _req, res, _next) => {
   const fileSizeLimit = err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE";
-  const unsupportedType = err.code === "UNSUPPORTED_FILE_TYPE";
-  const mimeMismatch = err.code === "MIME_TYPE_MISMATCH";
+  const unsupportedType = err?.code === "UNSUPPORTED_FILE_TYPE";
+  const mimeMismatch = err?.code === "MIME_TYPE_MISMATCH";
   console.error("Upload request rejected:", {
     stage: "multer-validation",
     errorName: err?.name || "Error",
     errorCode: err?.code || null
   });
-  const status = fileSizeLimit ? 413 : mimeMismatch ? 415 : 400;
-  const message = fileSizeLimit ? "File exceeds the 20 MB upload limit."
+  const status = fileSizeLimit ? 413 : mimeMismatch ? 415 : unsupportedType ? 400 : 500;
+  const message = fileSizeLimit ? "File exceeds the 50 MB upload limit."
     : unsupportedType ? "Only PDF, XLSX and CSV files are supported."
       : mimeMismatch ? "The file type does not match its extension."
-        : "The upload request could not be processed.";
+        : "The upload could not be processed. Please try again.";
   res.status(status).json({ error: message });
 });
 const configuredPort = (process.env.PORT || "5000").trim();
