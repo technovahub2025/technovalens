@@ -1,3 +1,4 @@
+import { workspaceHeaders } from "./workspace.js";
 import { useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
 import {
@@ -10,6 +11,7 @@ import {
   Area, AreaChart, CartesianGrid, ResponsiveContainer,
   Tooltip, XAxis, YAxis
 } from "recharts";
+import AnalyticsReports from "./AnalyticsReports.jsx";
 
 // =====================================================
 // API CONFIGURATION
@@ -152,6 +154,9 @@ export default function App() {
   ]);
 
   const [documents, setDocuments] = useState([]);
+  const [selectedWorkbookId, setSelectedWorkbookId] = useState(() => {
+    try { return localStorage.getItem("technovalens.selectedWorkbookId") || ""; } catch { return ""; }
+  });
   const [conversations, setConversations] = useState([]);
 
   const [currentConversationId, setCurrentConversationId] = useState(null);
@@ -435,6 +440,10 @@ export default function App() {
 
       setFileInfo(data);
       setFile(selected);
+      if (data.kind === "spreadsheet") {
+        setSelectedWorkbookId(data.fileId);
+        try { localStorage.setItem("technovalens.selectedWorkbookId", data.fileId); } catch { /* Storage may be disabled. */ }
+      }
 
       setPreview(
         Array.isArray(data.preview) ? data.preview : []
@@ -604,7 +613,8 @@ export default function App() {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              Accept: "text/event-stream"
+              Accept: "text/event-stream",
+              ...workspaceHeaders
             },
             body: JSON.stringify({
               fileId: requestFileId,
@@ -1812,6 +1822,18 @@ export default function App() {
               </section>
 
             </>
+
+          ) : active === "Analytics" || active === "Reports" ? (
+
+            <AnalyticsReports
+              page={active}
+              files={documents}
+              selectedId={selectedWorkbookId}
+              onSelect={id => {
+                setSelectedWorkbookId(id);
+                try { localStorage.setItem("technovalens.selectedWorkbookId", id); } catch { /* Storage may be disabled. */ }
+              }}
+            />
 
           ) : (
 

@@ -9,6 +9,7 @@ import path from "node:path";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import ExcelJS from "exceljs";
 
+const fetch = (url, init = {}) => globalThis.fetch(url, { ...init, headers: { 'X-Workspace-Token': '1'.repeat(64), ...init.headers } });
 const backendDir = path.resolve(import.meta.dirname, "..");
 const mock = { mode: "success", calls: 0, callsByModel: {}, active: 0, maxActive: 0, delayMs: 0 };
 const providerServer = createServer(async (req, res) => {
@@ -81,6 +82,7 @@ async function startBackend({ dataDir, budget = 15, apiKey = " test-only-key " }
     env: {
       ...process.env,
       PORT: String(port),
+      CONVERSATION_STORAGE: "file",
       GEMINI_API_KEY: apiKey,
       GEMINI_MODEL: "gemini-flash-latest",
       PRIMARY_GEMINI_MODEL: "gemini-flash-latest",

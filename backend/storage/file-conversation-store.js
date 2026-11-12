@@ -1,0 +1,16 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+
+// Explicit standalone mode for local development and isolated integration tests.
+export class FileConversationStore {
+  constructor(directory) { this.file = path.join(directory, 'conversations.json'); this.items = []; }
+  async initialize() { try { this.items = JSON.parse(fs.readFileSync(this.file, 'utf8')); } catch (e) { if (e.code !== 'ENOENT') throw e; } }
+  save() { const temp = `${this.file}.tmp`; fs.writeFileSync(temp, JSON.stringify(this.items), { mode: 0o600 }); fs.renameSync(temp, this.file); }
+  async list() { return this.items.map(({ messages, ...item }) => ({ ...item, messageCount: messages.length, lastMessage: messages.at(-1)?.text?.slice(0,180) || '' })).sort((a,b) => b.updatedAt.localeCompare(a.updatedAt)); }
+  async get(id) { return this.items.find(item => item.id === id) || null; }
+  async create(fileId, title) { const now = new Date().toISOString(); const item = { id: crypto.randomUUID(), fileId, title: String(title).slice(0,200), createdAt: now, updatedAt: now, messages: [] }; this.items.push(item); this.save(); return item; }
+  async append(id, input) { const item = await this.get(id); if (!item) return null; const message = { ...input, id: crypto.randomUUID(), createdAt: new Date().toISOString() }; item.messages.push(message); item.updatedAt = message.createdAt; this.save(); return message; }
+  async delete(id) { const count = this.items.length; this.items = this.items.filter(item => item.id !== id); if (count === this.items.length) return false; this.save(); return true; }
+  async deleteForFile(fileId) { this.items = this.items.filter(item => item.fileId !== fileId); this.save(); }
+}

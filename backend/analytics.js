@@ -20,10 +20,105 @@ export function parseNumeric(value) {
   const trimmed = value.trim();
   if (!trimmed) return null;
   const negative = /^\(.*\)$/.test(trimmed);
-  const cleaned = trimmed.replace(/[(),$€£₹%\s]/g, "").replace(/,/g, "");
-  if (!/^[+-]?(?:\d+\.?\d*|\.\d+)$/.test(cleaned)) return null;
+  const unwrapped = negative ? trimmed.slice(1, -1).trim() : trimmed;
+  // Currency at the start, percent at the end, standard comma grouping only.
+  const numericText = unwrapped.replace(/^([$\u20ac\u00a3\u20b9])\s*/, '').replace(/\s*%$/, '');
+  if (!/^[+-]?(?:(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(numericText)) return null;
+  if (negative && /^[+-]/.test(numericText)) return null;
+  const cleaned = numericText.replace(/,/g, '');
   const number = Number(cleaned) * (negative ? -1 : 1);
   return Number.isFinite(number) ? number : null;
+}
+
+export const isBlank = value => value === null || value === undefined || (typeof value === "string" && !value.trim());
+const dateLike = value => {
+  if (value instanceof Date) return !Number.isNaN(value.valueOf());
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}(?:[T ].*)?$/.test(value)) return false;
+  const prefix = value.slice(0, 10), date = Date.parse(`${prefix}T00:00:00.000Z`);
+  return Number.isFinite(date) && new Date(date).toISOString().slice(0, 10) === prefix && Number.isFinite(Date.parse(value));
+};
+const groupValue = value => isBlank(value) ? "(blank)" : String(value);
+
+export function filterDataset(sheet, options = {}) {
+  const columns = sheet.columns || Object.keys(sheet.rows[0] || {});
+  const search = String(options.search || "").trim().toLocaleLowerCase();
+  const categoryColumn = columns.includes(options.categoryColumn) ? options.categoryColumn : "";
+  return sheet.rows.filter(row => (!search || columns.some(c => String(row[c] ?? "").toLocaleLowerCase().includes(search))) &&
+    (!categoryColumn || options.categoryValue === undefined || options.categoryValue === "" || groupValue(row[categoryColumn]) === options.categoryValue));
+}
+
+export function previewDataset(sheet, options = {}) {
+  const columns = sheet.columns || Object.keys(sheet.rows[0] || {});
+  const rows = filterDataset(sheet, options);
+  if (columns.includes(options.sort)) rows.sort((a, b) => {
+    const left = a[options.sort], right = b[options.sort];
+    const ln = parseNumeric(left), rn = parseNumeric(right);
+    const comparison = isBlank(left) ? (isBlank(right) ? 0 : 1) : isBlank(right) ? -1 : ln !== null && rn !== null ? ln - rn : String(left).localeCompare(String(right), undefined, { numeric: true });
+    return comparison * (options.direction === 'desc' ? -1 : 1);
+  });
+  const pageSize = Math.min(100, Math.max(1, parseInt(options.pageSize, 10) || 25));
+  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+  const page = Math.min(totalPages, Math.max(1, parseInt(options.page, 10) || 1));
+  return { columns, rows: rows.slice((page - 1) * pageSize, page * pageSize), page, pageSize, total: rows.length, totalPages };
+}
+
+export function analyzeDataset(sheet, options = {}) {
+  const columns = sheet.columns || Object.keys(sheet.rows[0] || {});
+  const rows = filterDataset(sheet, options);
+  const profile = source => Object.fromEntries(columns.map(column => {
+    const present = source.map(row => row[column]).filter(v => !isBlank(v));
+    const numeric = present.map(parseNumeric).filter(v => v !== null);
+    const unique = new Set(present.map(v => String(v))).size;
+    const type = !present.length ? 'text' : present.filter(dateLike).length / present.length >= .8 ? 'date' : numeric.length / present.length >= .8 ? 'numeric' : unique <= Math.min(30, Math.max(2, Math.ceil(present.length * .25))) ? 'category' : 'text';
+    return [column, { type, unique }];
+  }));
+  // Detect types from the full sheet, so filtering does not change chart columns.
+  const schema = profile(sheet.rows);
+  const columnStats = Object.fromEntries(columns.map(column => {
+    let missing = 0, numericCount = 0, sum = 0, min = Infinity, max = -Infinity, invalid = 0;
+    const unique = new Set(); const type = schema[column].type;
+    for (const row of rows) {
+      const value = row[column];
+      if (isBlank(value)) { missing++; continue; }
+      unique.add(String(value));
+      const n = parseNumeric(value);
+      if (type === 'numeric' && n !== null) { numericCount++; sum += n; min = Math.min(min, n); max = Math.max(max, n); }
+      else if ((type === 'numeric' && n === null) || (type === 'date' && !dateLike(value))) invalid++;
+    }
+    return [column, { type, count: rows.length, missing, unique: unique.size, invalid, numericCount, sum: numericCount ? sum : null, average: numericCount ? sum / numericCount : null, min: numericCount ? min : null, max: numericCount ? max : null }];
+  }));
+  const seen = new Set(); let duplicateRows = 0;
+  for (const row of rows) { const key = JSON.stringify(columns.map(c => isBlank(row[c]) ? null : row[c])); if (seen.has(key)) duplicateRows++; else seen.add(key); }
+  // Options always come from the original data, so a filtered value can be changed.
+  const categories = Object.fromEntries(columns.filter(c => ['category', 'text'].includes(schema[c].type)).map(c => [c, [...new Set(sheet.rows.map(r => groupValue(r[c])))].slice(0, 200)]));
+  const numeric = columns.filter(c => schema[c].type === 'numeric');
+  const category = columns.filter(c => schema[c].type === 'category');
+  const dates = columns.filter(c => schema[c].type === 'date');
+  const groupColumn = category[0] || columns.find(c => schema[c].type === 'text' && schema[c].unique <= 30);
+  const grouped = groupColumn ? [...rows.reduce((map, row) => { const key = groupValue(row[groupColumn]); map.set(key, (map.get(key) || 0) + 1); return map; }, new Map())].map(([name, count]) => ({ name, count })).sort((a,b) => b.count-a.count) : [];
+  const barData = grouped.slice(0, 12);
+  const pie = grouped.slice(0, 6);
+  const other = grouped.slice(6).reduce((sum, item) => sum + item.count, 0);
+  if (other) pie.push({ name: 'Other groups (combined)', count: other });
+  const metric = numeric.find(c => !/(^id$|[ _]id$|code|postal|zip|year)/i.test(c)) || numeric[0];
+  const periodColumn = dates[0];
+  const trend = periodColumn && metric ? [...rows.reduce((map, row) => {
+    const n = parseNumeric(row[metric]);
+    if (dateLike(row[periodColumn]) && n !== null) { const period = new Date(row[periodColumn]).toISOString().slice(0, 7); map.set(period, (map.get(period) || 0) + n); }
+    return map;
+  }, new Map())].sort(([a], [b]) => a.localeCompare(b)).slice(-24).map(([period, value]) => ({ period, value })) : [];
+  const missingValues = Object.values(columnStats).reduce((sum, s) => sum + s.missing, 0);
+  const findings = [`${rows.length} records match the selected worksheet and filters.`, `${missingValues} missing cells; ${duplicateRows} duplicate rows beyond their first occurrence.`];
+  const kpis = numeric.filter(c => !/(^id$|[ _]id$|code|postal|zip|year)/i.test(c)).slice(0, 3).map(column => ({ column, label: `Average ${column}`, value: columnStats[column].average, hint: `${columnStats[column].numericCount} numeric values` }));
+  for (const { column } of kpis) { const s = columnStats[column]; if (s.numericCount) findings.push(`${column}: average ${s.average.toLocaleString('en', { maximumFractionDigits: 4 })}; range ${s.min} to ${s.max} (${s.numericCount} numeric values).`); }
+  if (grouped[0]) findings.push(`${grouped[0].name} is the largest ${groupColumn} group: ${grouped[0].count} records (${rows.length ? (grouped[0].count / rows.length * 100).toFixed(1) : 0}%).`);
+  const warnings = [];
+  if (sheet.formulaCount) warnings.push(`${sheet.formulaCount} formula cells: cached results only; formulas were not recalculated. ${sheet.uncachedFormulas || 0} cells without cached results are missing.`);
+  const invalidValues = Object.values(columnStats).reduce((n, s) => n + s.invalid, 0);
+  if (invalidValues) warnings.push(`${invalidValues} values do not match their inferred numeric/date column type and are excluded from those calculations.`);
+  warnings.push('Types inferred from nonblank values (80% threshold). Dates use ISO YYYY-MM-DD. Numeric text retains its displayed units; percentages are percentage points. Blank physical Excel rows are excluded.');
+  return { sheetName: sheet.name, rowCount: rows.length, totalRowCount: sheet.rows.length, columnCount: columns.length, duplicateRows, missingValues, invalidValues, completeness: rows.length * columns.length ? (1 - missingValues / (rows.length * columns.length)) * 100 : null, columnStats, columns, types: { numeric, category, date: dates, text: columns.filter(c => schema[c].type === 'text') }, categories, kpis, findings, warnings,
+    charts: { bar: { title: groupColumn ? `Records by ${groupColumn}` : 'Records by category', data: barData, omittedGroups: Math.max(0, grouped.length - 12) }, pie, trend: { title: periodColumn && metric ? `${metric} by month` : 'Monthly trend', data: trend, valueColumn: metric || null, dateColumn: periodColumn || null } }, filteredRows: rows };
 }
 
 export function summarizeSheet(sheet) {

@@ -33,7 +33,52 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173. The Vite development server forwards `/api` requests to `http://localhost:5000`.
+Open http://localhost:5173/technovalens/. The Vite development server forwards `/api` requests to `http://localhost:5000`, or the `VITE_API_URL` configured in `frontend/.env`.
+
+## Analytics and Reports
+
+The existing Dashboard layout and chart components are preserved. Upload XLSX or UTF-8 CSV through the existing upload control. Every worksheet is analyzed locally on upload. Analytics and Reports share a workbook, worksheet, search and exact category filter; these choices persist in browser storage. No Gemini requests are needed for these pages.
+
+- Analytics includes real row/column/sheet counts, missing and duplicate values, numeric KPIs, category charts, monthly trends, column profiles and server-paginated sortable rows.
+- Reports includes deterministic findings and downloads genuine PDF and XLSX files. PDFs render vector charts and paginate column-profile tables with repeated headings and page numbers. Excel exports contain Dataset Overview, Column Statistics, Findings, Chart Data and Selected Data worksheets. Both exports apply current filters.
+- Dates are recognized as native Excel dates or ISO date text (`YYYY-MM-DD`). Ambiguous date text stays text. Numeric strings support standard thousands separators, currency prefixes, scientific notation and percentage suffixes. Percentages retain displayed percentage-point units. Mixed numeric/date columns use an 80% nonblank threshold; invalid values are counted and excluded from numeric calculations. Missing cells are blank/null/whitespace. Duplicates count occurrences beyond the first.
+- Formulas use cached results only. Missing formula caches and Excel error cells become missing values; formulas are never recalculated. Fully empty physical Excel rows are excluded. Duplicate/blank headers receive unique names rather than overwriting columns.
+- Each request is capped at 50 MB; workbooks at 32 worksheets, 100,000 rows, 256 columns and 2,000,000 cells. Expanded XLSX archives are capped at 128 MB. Parsing runs in a worker with a 256 MB heap limit and 30 second timeout. Larger files receive an actionable error. Preview pages contain at most 100 rows.
+
+### Backend and local setup
+
+Install dependencies with `npm install` in both `backend` and `frontend`. The existing MongoDB conversation store remains the default: set `MONGODB_URI` and start MongoDB before `npm run dev` in `backend`. For standalone development without MongoDB, set `CONVERSATION_STORAGE=file` in `backend/.env`. This uses the same file and conversation APIs with persistent local JSON conversations. Gemini is optional for Analytics, Reports and local chat calculations.
+
+In a second terminal run `npm run dev` in `frontend`. Production verification: `npm run build` in `frontend`; tests: `npm test` in `backend`. Integration tests use isolated temporary storage and a mock Gemini service, without a real API key or MongoDB.
+
+### Private workspaces and existing uploads
+
+This application has no account login. File access is isolated by a random private browser workspace token, sent as `X-Workspace-Token`; the backend stores only its SHA-256 hash. File lists, previews, analytics, reports, chat and conversation access all check ownership. Keep the token private. Clearing browser storage loses access to that browser's uploads; this is browser workspace isolation, not account authentication or cross-device sign-in.
+
+Older uploads have no recorded owner, so the server cannot safely show them to every browser. Their stored data is preserved. Re-upload them, or have the server administrator assign legacy uploads from a **single known owner**:
+
+1. Open the app in that owner's browser. In its developer console, read `localStorage.getItem('technovalens.workspaceToken')`.
+2. Stop the backend. In the backend PowerShell terminal set `$env:WORKSPACE_TOKEN = '<that private token>'` and run `npm run migrate:workspace`.
+3. Remove the temporary variable with `Remove-Item Env:WORKSPACE_TOKEN`, restart the backend, and refresh the app. Existing file IDs and linked conversations are retained.
+
+The migration only assigns currently unowned files. Do not use the bulk migration on legacy storage belonging to multiple people; first separate records by verified ownership. Already owned files are never reassigned.
+
+### Analytics and report APIs
+
+All routes require `X-Workspace-Token: <64 lowercase hexadecimal characters>`. Missing tokens return 401; another workspace's file returns 404. JSON errors use `{ "error": "message" }`.
+
+| Endpoint | Response |
+| --- | --- |
+| `GET /api/analytics/:id` | Workbook metadata, generation date, sheet counts, inferred types, KPIs, numeric/quality statistics, charts, findings, warnings |
+| `GET /api/analytics/:id/preview` | `{ columns, rows, page, pageSize, total, totalPages }` |
+| `GET /api/reports/:id.pdf` | Paginated PDF report |
+| `GET /api/reports/:id.xlsx` | Excel report with five summary/data worksheets |
+
+All accept optional `sheet`, `search`, `categoryColumn` and `categoryValue`. Preview also accepts `sort`, `direction=asc|desc`, `page` and `pageSize` (1–100). Invalid sheet names return 400. Existing `/api/files`, `/api/files/upload`, `/api/excel/upload`, preview and conversation endpoints remain available under the same workspace protection.
+
+Implementation: `frontend/src/AnalyticsReports.jsx`, `frontend/src/workspace.js` and scoped additions in `styles.css`; integration in `App.jsx` and the local proxy default in `vite.config.js`. Backend changes are in `analytics.js`, `spreadsheet-parser.js`, `reports.js`, `server.js`, the optional `storage/file-conversation-store.js`, and `migrate-workspace.js`. Coverage lives in `backend/tests/analytics-reports.test.js`; the existing API suite now sends workspace credentials.
+
+An optional `backend/tests/browser-smoke.mjs` checks upload, Recharts, filtering, report PDF downloads, selection persistence and mobile overflow. With Playwright installed locally (or `PLAYWRIGHT_MODULE` pointing to an existing installation), run `node backend/tests/browser-smoke.mjs` from the project root. It requires port 5173 to be free, starts isolated servers, and deletes its temporary data afterward.
 
 ## AI usage controls
 

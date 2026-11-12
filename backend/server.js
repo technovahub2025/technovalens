@@ -2,14 +2,16 @@ import express from "express";
 import cors from "cors";
 import multer from "multer";
 import dotenv from "dotenv";
-import ExcelJS from "exceljs";
-import { parse } from "csv-parse/sync";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { parseSpreadsheetInWorker } from "./spreadsheet-parser.js";
+import { createExcelReport, createPdfReport } from "./reports.js";
+import { FileConversationStore } from "./storage/file-conversation-store.js";
 import { GoogleGenAI } from "@google/genai";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
 import fs from "fs";
 import path from "path";
-import { answerLocally, buildCompactSheetContext, hashWorkbook, normalizeQuestion } from "./analytics.js";
+import { analyzeDataset, previewDataset, answerLocally, buildCompactSheetContext, hashWorkbook, normalizeQuestion } from "./analytics.js";
 import { answerPdfLocally, localLimitation } from "./local-document.js";
 import { connectDB } from "./config/db.js";
 import { JsonConversationStore } from "./storage/json-conversation-store.js";
@@ -54,7 +56,7 @@ const corsOptions = {
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Workspace-Token"],
   optionsSuccessStatus: 204
 };
 
@@ -63,6 +65,19 @@ const corsOptions = {
 app.use(cors(corsOptions));
 
 app.use(express.json({ limit: "2mb" }));
+
+// Scope every file lookup to the private browser workspace. Tokens are never persisted raw.
+const workspaceContext = new AsyncLocalStorage();
+const owns = document => Boolean(document && document.ownerHash === workspaceContext.getStore());
+app.use('/api', (req, res, next) => {
+  if (['/health', '/usage'].includes(req.path) || req.method === 'OPTIONS') return next();
+  const token = req.get('X-Workspace-Token') || '';
+  if (!/^[a-f0-9]{64}$/.test(token)) return res.status(401).json({ error: 'A private workspace token is required. Reload the application.' });
+  res.set('Cache-Control', 'no-store');
+  const hash = crypto.createHash('sha256').update(token).digest('hex');
+  req.ownerHash = hash;
+  workspaceContext.run(hash, () => next());
+});
 
 const MAX_UPLOAD = 50 * 1024 * 1024;
 const acceptedMimeTypes = {
@@ -119,6 +134,7 @@ const backendInstanceId = crypto.randomUUID();
 console.info("Uploaded document store ready:", { backendInstanceId, mapSize: documents.size, store: documentStorePath });
 
 function getDocument(fileId, { reload = false } = {}) {
+  if (typeof fileId !== 'string' || !/^[a-f0-9-]{36}$/i.test(fileId)) return undefined;
   let document = reload ? null : documents.get(fileId);
   if ((!document || reload) && typeof fileId === "string") {
     try {
@@ -129,7 +145,7 @@ function getDocument(fileId, { reload = false } = {}) {
       if (error?.code !== "ENOENT") console.warn("Persisted document lookup failed:", { fileId, errorName: error?.name || "Error" });
     }
   }
-  return document;
+  return owns(document) ? document : undefined;
 }
 
 function describeDocument(document) {
@@ -410,7 +426,7 @@ async function receiveFile(req, res) {
       return res.status(400).json({ error: "This file is not a valid XLSX workbook. Check the file and try again." });
     }
     const fileId = crypto.randomUUID();
-    const common = { fileId, name: req.file.originalname, type: ext.toUpperCase(), size: req.file.size, uploadedAt: new Date().toISOString() };
+    const common = { ownerHash: req.ownerHash, fileId, name: req.file.originalname, type: ext.toUpperCase(), size: req.file.size, uploadedAt: new Date().toISOString() };
     let record, response;
     if (ext === "pdf") {
       let PDFParse;
@@ -446,33 +462,20 @@ async function receiveFile(req, res) {
         return res.status(400).json({ error: password ? "This PDF is password-protected. Unlock it and upload it again." : "This PDF is unreadable or damaged. Please upload a valid PDF." });
       } finally { await parser?.destroy?.().catch?.(() => {}); }
     } else {
-      let sheets;
-      if (ext === "csv") {
-        processingStage = "csv-parsing";
-        const rows = parse(req.file.buffer.toString("utf8"), { columns: true, skip_empty_lines: true, bom: true, relax_column_count: true });
-        sheets = [{ name: "CSV data", rows }];
-      } else {
-        processingStage = "xlsx-parsing";
-        const workbook = new ExcelJS.Workbook();
-        await workbook.xlsx.load(req.file.buffer);
-        sheets = workbook.worksheets.map(ws => {
-          const headers = ws.getRow(1).values.slice(1).map((v, i) => String(v ?? `Column ${i + 1}`));
-          const rows = [];
-          ws.eachRow((row, rowNumber) => {
-            if (rowNumber === 1) return;
-            const values = row.values.slice(1);
-            if (!values.some(v => v !== null && v !== undefined && v !== "")) return;
-            rows.push(Object.fromEntries(headers.map((header, i) => [header, values[i] ?? null])));
-          });
-          return { name: ws.name, rows };
-        });
-      }
+      processingStage = ext === 'csv' ? 'csv-parsing' : 'xlsx-parsing';
+      const sheets = await parseSpreadsheetInWorker(req.file.buffer, ext);
       const first = sheets[0];
       if (!first) return res.status(400).json({ error: "No worksheets found in this file." });
-      const columns = first.rows.length ? Object.keys(first.rows[0]) : [];
+      const columns = first.columns;
       const { text: aiContext, truncated: aiContextTruncated } = buildSpreadsheetAiContext(sheets);
       record = { ...common, kind: "spreadsheet", sheets, sheetName: first.name, rows: first.rows, columns, aiContext, aiContextTruncated };
       response = { ...common, kind: "spreadsheet", sheetName: first.name, sheetNames: sheets.map(s => s.name), rowCount: first.rows.length, columnCount: columns.length, columns, preview: first.rows.slice(0, 10) };
+      // Analyze each worksheet immediately; keep summaries bounded and omit raw rows.
+      record.analytics = sheets.map(sheet => {
+        const { filteredRows, ...summary } = analyzeDataset(sheet);
+        return summary;
+      });
+      response.analysis = record.analytics[0];
     }
     record.contentHash = record.kind === "spreadsheet"
       ? hashWorkbook(record.sheets)
@@ -488,6 +491,7 @@ async function receiveFile(req, res) {
 );
     response.conversationId = conversation.id;
     console.info("Uploaded document stored:", { backendInstanceId, fileId, mapSize: documents.size, kind: record.kind });
+    delete response.ownerHash;
     res.json(response);
   } catch (error) {
     const invalidDocument = ["pdf-extraction", "csv-parsing", "xlsx-parsing"].includes(processingStage);
@@ -500,7 +504,7 @@ async function receiveFile(req, res) {
     });
     res.status(invalidDocument ? 400 : 500).json({
       error: invalidDocument
-        ? (ext === "pdf" ? "Could not extract text from this PDF. Check that it is readable and try again." : "Could not read this spreadsheet. Check that it is a valid XLSX or CSV file.")
+        ? (ext === "pdf" ? "Could not extract text from this PDF. Check that it is readable and try again." : `Could not read this spreadsheet: ${String(error.message).slice(0, 240)}`)
         : "The server could not process this upload. Check the backend logs and try again."
     });
   }
@@ -509,7 +513,7 @@ app.post("/api/files/upload", upload.single("file"), receiveFile);
 // Keep the original Excel upload URL working for existing clients; it now accepts CSV too.
 app.post("/api/excel/upload", upload.single("file"), receiveFile);
 app.get("/api/files", (_req, res) => {
-  const list = [...documents.values()].map(listDocumentMetadata).sort((a, b) => b.uploadedAt.localeCompare(a.uploadedAt));
+  const list = [...documents.values()].filter(owns).map(listDocumentMetadata).sort((a, b) => b.uploadedAt.localeCompare(a.uploadedAt));
   res.json(list);
 });
 app.get("/api/files/:id", (req, res) => {
@@ -521,7 +525,7 @@ app.get("/api/files/:id", (req, res) => {
 app.get("/api/conversations", async (_req, res) => {
   try {
     const conversations = await conversationStore.list();
-    res.json(conversations.filter(item => documents.has(item.fileId)));
+    res.json(conversations.filter(item => getDocument(item.fileId)));
   } catch (error) {
     console.error("Conversation list error:", error);
     res.status(500).json({ error: "Could not load conversations." });
@@ -603,6 +607,8 @@ app.post("/api/conversations/:id/messages", async (req, res) => {
 
 app.delete("/api/conversations/:id", async (req, res) => {
   try {
+    const conversation = await conversationStore.get(req.params.id);
+    if (!conversation || !getDocument(conversation.fileId)) return res.status(404).json({ error: 'Conversation not found.' });
     const deleted = await conversationStore.delete(req.params.id);
 
     if (!deleted) {
@@ -616,25 +622,50 @@ app.delete("/api/conversations/:id", async (req, res) => {
   }
 });
 
-app.get("/api/conversations/:id", (req, res) => {
-  const conversation = conversationStore.get(req.params.id);
-  if (!conversation || !getDocument(conversation.fileId)) return res.status(404).json({ error: "Conversation not found." });
-  res.json(conversation);
+app.get("/api/excel/files", (_req, res) => res.json([...documents.values()].filter(d => owns(d) && d.kind === "spreadsheet").map(d => ({ fileId: d.fileId, fileName: d.name, sheetName: d.sheetName, rowCount: d.rows.length, columnCount: d.columns.length }))));
+function getSheetRequest(req, res) {
+  const doc = getDocument(req.params.id);
+  if (!doc || doc.kind !== 'spreadsheet') { res.status(404).json({ error: 'Workbook not found in this workspace.' }); return null; }
+  const sheet = req.query.sheet ? doc.sheets.find(s => s.name === req.query.sheet) : doc.sheets[0];
+  if (!sheet) { res.status(400).json({ error: 'Worksheet not found. Select an existing worksheet.' }); return null; }
+  return { doc, sheet };
+}
+function reportStats(sheet, query) {
+  const stats = analyzeDataset(sheet, query);
+  stats.filters = Object.fromEntries(['search', 'categoryColumn', 'categoryValue'].filter(key => query[key]).map(key => [key, query[key]]));
+  return stats;
+}
+app.get('/api/analytics/:id', (req, res) => {
+  const request = getSheetRequest(req, res); if (!request) return;
+  const { doc, sheet } = request;
+  const cached = !req.query.search && !req.query.categoryValue && doc.analytics?.find(s => s.sheetName === sheet.name);
+  const { filteredRows, ...summary } = cached || reportStats(sheet, req.query);
+  res.json({ fileId: doc.fileId, fileName: doc.name, uploadedAt: doc.uploadedAt, generatedAt: new Date().toISOString(), sheetCount: doc.sheets.length, sheetNames: doc.sheets.map(s => s.name), ...summary });
 });
-app.post("/api/conversations/:id/messages", (req, res) => {
-  const conversation = conversationStore.get(req.params.id);
-  if (!conversation || !getDocument(conversation.fileId)) return res.status(404).json({ error: "Conversation not found." });
-  const { role, text } = req.body || {};
-  if (!["user", "assistant"].includes(role) || typeof text !== "string" || !text.trim() || text.length > 30000) {
-    return res.status(400).json({ error: "A valid user or assistant message is required (up to 30,000 characters)." });
-  }
-  res.status(201).json(conversationStore.append(req.params.id, { ...req.body, role, text: text.trim() }));
+app.get('/api/analytics/:id/preview', (req, res) => {
+  const request = getSheetRequest(req, res); if (!request) return;
+  res.json(previewDataset(request.sheet, req.query));
 });
-app.delete("/api/conversations/:id", (req, res) => {
-  if (!conversationStore.delete(req.params.id)) return res.status(404).json({ error: "Conversation not found." });
-  res.json({ status: "removed" });
+app.get('/api/reports/:id.xlsx', async (req, res, next) => {
+  const request = getSheetRequest(req, res); if (!request) return;
+  try {
+    const { doc, sheet } = request;
+    const workbook = createExcelReport(doc, sheet, reportStats(sheet, req.query), new Date().toISOString());
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(doc.name.replace(/\.[^.]+$/, ''))}-report.xlsx"`);
+    await workbook.xlsx.write(res); res.end();
+  } catch (error) { if (res.headersSent) res.destroy(); else next(error); }
 });
-app.get("/api/excel/files", (_req, res) => res.json([...documents.values()].filter(d => d.kind === "spreadsheet").map(d => ({ fileId: d.fileId, fileName: d.name, sheetName: d.sheetName, rowCount: d.rows.length, columnCount: d.columns.length }))));
+app.get('/api/reports/:id.pdf', (req, res, next) => {
+  const request = getSheetRequest(req, res); if (!request) return;
+  try {
+    const { doc, sheet } = request;
+    const pdf = createPdfReport(doc, sheet, reportStats(sheet, req.query), new Date().toISOString());
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(doc.name.replace(/\.[^.]+$/, ''))}-report.pdf"`);
+    pdf.on('error', () => res.destroy()); pdf.pipe(res); pdf.end();
+  } catch (error) { if (res.headersSent) res.destroy(); else next(error); }
+});
 app.get("/api/excel/:id/preview", (req, res) => {
   const doc = getDocument(req.params.id);
   if (!doc || doc.kind !== "spreadsheet") return res.status(404).json({ error: "Workbook not found. Please upload it again." });
@@ -914,6 +945,7 @@ async function analyzeDocument(doc, question, onProgress = () => {}, abortSignal
   }
   const sheetKey = doc.kind === "spreadsheet" ? buildCompactSheetContext(doc.sheets, normalizedQuestion).sheetKey : "document";
   const cacheKey = crypto.createHash("sha256").update(JSON.stringify({
+    ownerHash: doc.ownerHash,
     contentHash: doc.contentHash || doc.fileId,
     sheetKey,
     question: normalizeQuestion(normalizedQuestion),
@@ -1196,10 +1228,10 @@ async function startServer() {
     }
 
     // Connect to MongoDB first
-    await connectDB();
+    if (process.env.CONVERSATION_STORAGE !== "file") await connectDB();
 
     // Initialize MongoDB conversation storage
-    conversationStore = new JsonConversationStore(DATA_DIR);
+    conversationStore = process.env.CONVERSATION_STORAGE === "file" ? new FileConversationStore(DATA_DIR) : new JsonConversationStore(DATA_DIR);
     await conversationStore.initialize();
 
     // Recreate conversations for existing documents that don't have one
