@@ -6,6 +6,7 @@ import { createInterface } from 'node:readline';
 import { Readable } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 import { parse as csvParse } from 'csv-parse';
+import { createParserTimings } from './parser-timings.js';
 
 const MAIN = new Set(['http://schemas.openxmlformats.org/spreadsheetml/2006/main', 'http://purl.oclc.org/ooxml/spreadsheetml/main']);
 const MAX_ROWS=100000, MAX_COLUMNS=256, MAX_CELLS=2000000, MAX_EXPANDED=128*1024*1024;
@@ -28,9 +29,9 @@ export function checkZip(buffer) {
   }
 }
 
-function sink(filename) {
-  const fd=fs.openSync(filename,'w',0o600);let pending='';
-  return {write(value){pending+=JSON.stringify(value)+'\n';if(pending.length>65536){fs.writeSync(fd,pending);pending='';}},close(){if(pending)fs.writeSync(fd,pending);fs.closeSync(fd);}};
+function sink(filename,timings,worksheetIndex) {
+  const fd=timings.sync('storageWriteMs',()=>fs.openSync(filename,'w',0o600),worksheetIndex);let pending='';
+  return {write(value){pending+=JSON.stringify(value)+'\n';if(pending.length>65536){timings.sync('storageWriteMs',()=>fs.writeSync(fd,pending),worksheetIndex);pending='';}},close(){timings.sync('storageWriteMs',()=>{try{if(pending)fs.writeSync(fd,pending);}finally{fs.closeSync(fd);}},worksheetIndex);}};
 }
 export async function* readStoredRows(filename, columns) {
   const stream=fs.createReadStream(filename,{encoding:'utf8'});
@@ -42,30 +43,32 @@ export async function* readStoredRows(filename, columns) {
 // Shared strings are indexed on disk with a small bounded read cache. A unique
 // string in every cell must not turn into a second workbook-sized JS heap.
 class Strings {
-  constructor(directory){this.filename=path.join(directory,'strings.tmp');this.fd=fs.openSync(this.filename,'w+',0o600);this.offsets=[];this.lengths=[];this.position=0;this.cache=new Map();this.cacheBytes=0;}
-  add(text){const bytes=Buffer.from(text);if(this.offsets.length>=MAX_CELLS || bytes.length>1024*1024)throw limit();this.offsets.push(this.position);this.lengths.push(bytes.length);fs.writeSync(this.fd,bytes,0,bytes.length,this.position);this.position+=bytes.length;}
-  get(index){if(!Number.isInteger(index)||index<0||index>=this.offsets.length)throw new Error('Invalid XLSX shared string reference.');if(this.cache.has(index))return this.cache.get(index);const bytes=Buffer.allocUnsafe(this.lengths[index]);fs.readSync(this.fd,bytes,0,bytes.length,this.offsets[index]);const value=bytes.toString('utf8');if(this.cache.size>=512||this.cacheBytes+bytes.length>2*1024*1024){this.cache.clear();this.cacheBytes=0;}this.cache.set(index,value);this.cacheBytes+=bytes.length;return value;}
+  constructor(directory,timings){this.timings=timings;this.filename=path.join(directory,'strings.tmp');this.fd=fs.openSync(this.filename,'w+',0o600);this.offsets=[];this.lengths=[];this.position=0;this.cache=new Map();this.cacheBytes=0;}
+  add(text){const bytes=Buffer.from(text);if(this.offsets.length>=MAX_CELLS || bytes.length>1024*1024)throw limit();this.offsets.push(this.position);this.lengths.push(bytes.length);this.timings.sync('storageWriteMs',()=>fs.writeSync(this.fd,bytes,0,bytes.length,this.position));this.position+=bytes.length;}
+  get(index){if(!Number.isInteger(index)||index<0||index>=this.offsets.length)throw new Error('Invalid XLSX shared string reference.');if(this.cache.has(index))return this.cache.get(index);const bytes=Buffer.allocUnsafe(this.lengths[index]);this.timings.sync('storageReadMs',()=>fs.readSync(this.fd,bytes,0,bytes.length,this.offsets[index]),this.worksheetIndex);const value=bytes.toString('utf8');if(this.cache.size>=512||this.cacheBytes+bytes.length>2*1024*1024){this.cache.clear();this.cacheBytes=0;}this.cache.set(index,value);this.cacheBytes+=bytes.length;return value;}
   close(){fs.closeSync(this.fd);fs.rmSync(this.filename,{force:true});}
 }
 
 function headersFor(values,width){const used=new Set();return Array.from({length:width},(_,i)=>{const base=String(values[i]??'').trim()||`Column ${i+1}`;let name=base,n=2;while(used.has(name))name=`${base} (${n++})`;used.add(name);return name;});}
 function headerScore(row){const values=Object.values(row.values).filter(v=>!blank(v));const text=values.filter(v=>typeof v==='string'&&!/^[-+\d.]+$/.test(v)&&!/^\d{4}-\d\d-\d\d/.test(v));const unique=new Set(text).size;return unique*3+Math.min(text.length,unique*1.5)+values.length*.05;}
 
-export async function streamSpreadsheet(buffer,ext,directory,{onProgress=()=>{}}={}) {
+export async function streamSpreadsheet(buffer,ext,directory,{onProgress=()=>{},timings=createParserTimings()}={}) {
   let totalRows=0,totalCells=0,xmlCells=0,expandedBytes=0;
   const manifests=[];
-  async function xml(entry,handlers,expectedRoot) {
+  async function xml(entry,handlers,expectedRoot,worksheetIndex) {
     if(!entry)throw new Error('Some declared worksheets could not be read. A required XLSX part is missing.');
     const parser=new SaxesParser({xmlns:true});let root=false;
     parser.on('doctype',()=>{throw new Error('DOCTYPE is not supported in XLSX XML.');});
     parser.on('error',()=>{throw new Error('Invalid XLSX XML.');});
     parser.on('opentag',node=>{if(!root){root=true;if(expectedRoot&&(node.local!==expectedRoot||!MAIN.has(node.uri)))throw new Error('Invalid XLSX XML: unsupported namespace or root.');}handlers.open?.(node);});
     parser.on('text',text=>handlers.text?.(text));parser.on('cdata',text=>handlers.text?.(text));parser.on('closetag',node=>handlers.close?.(node));
-    const stream=entry.stream(), decoder=new StringDecoder('utf8');
+    const stream=entry.stream(), decoder=new StringDecoder('utf8'),finishXml=timings.span('xmlMs',worksheetIndex);
     try {for await(const chunk of stream){expandedBytes+=chunk.length;if(expandedBytes>MAX_EXPANDED)throw new Error('Workbook exceeds the 128 MB expanded size limit.');parser.write(decoder.write(chunk));}parser.write(decoder.end()).close();}
-    finally {stream.destroy();}
+    finally {stream.destroy();finishXml();}
   }
   async function normalize(meta,rawFile,width,candidates,csv=false) {
+    const worksheetIndex=manifests.length+1,finishNormalization=timings.span('normalizationMs',worksheetIndex);
+    onProgress({stage:'worksheet-storage',worksheetIndex});
     if(width>MAX_COLUMNS)throw limit();
     const header=csv?candidates[0]:candidates.reduce((best,row)=>!best||headerScore(row)>headerScore(best)+.01?row:best,null);
     const values=header?Array.from({length:width},(_,i)=>header.values[i]):[];
@@ -77,16 +80,16 @@ export async function streamSpreadsheet(buffer,ext,directory,{onProgress=()=>{}}
       if(dateHeading&&typeof sub==='string'&&!blank(sub)&&!/^[-+\d.]+$/.test(sub)&&sub.length<100)values[i]=`${dateHeading} ${sub.trim()}`;
     }
     const columns=headersFor(values,width);
-    const filename=`sheet-${manifests.length}.ndjson`, writer=sink(path.join(directory,filename));let rowCount=0;
+    const filename=`sheet-${manifests.length}.ndjson`, writer=sink(path.join(directory,filename),timings,worksheetIndex);let rowCount=0;
     const lines=createInterface({input:fs.createReadStream(rawFile,{encoding:'utf8'}),crlfDelay:Infinity});
     try {for await(const line of lines){const row=JSON.parse(line);if(!header||row.number<=header.number)continue;const values=columns.map((_,i)=>row.values[i]??null);if(!row.formulas&&values.every(blank))continue;totalRows++;totalCells+=width;if(totalRows>MAX_ROWS||totalCells>MAX_CELLS)throw limit();writer.write(values);rowCount++;}}
-    finally {writer.close();lines.close();fs.rmSync(rawFile,{force:true});}
+    finally {writer.close();lines.close();fs.rmSync(rawFile,{force:true});finishNormalization();}
     const manifest={...meta,columns,rowCount,dataFile:filename,headerRow:header?.number||1};manifests.push(manifest);
     onProgress({stage:'worksheet-parsed',worksheetIndex:manifests.length,worksheetCount:ext==='csv'?1:undefined,rowCount,columnCount:width});
   }
   if(ext==='csv') {
     if(buffer.includes(0))throw new Error('CSV must be UTF-8 text.');
-    const filename=path.join(directory,'rows.tmp'), writer=sink(filename),candidates=[];let number=0,width=0;
+    const filename=path.join(directory,'rows.tmp'), writer=sink(filename,timings,1),candidates=[];let number=0,width=0;
     const parser=Readable.from([buffer]).pipe(csvParse({bom:true,skip_empty_lines:true,relax_column_count:true,max_record_size:1024*1024}));
     try {for await(const values of parser){number++;width=Math.max(width,values.length);if(width>MAX_COLUMNS||number>MAX_ROWS+1)throw limit();const row={number,values,formulas:0};if(!candidates.length)candidates.push(row);writer.write(row);}}
     finally{writer.close();parser.destroy();}
@@ -103,16 +106,17 @@ export async function streamSpreadsheet(buffer,ext,directory,{onProgress=()=>{}}
   await xml(entries.get('xl/_rels/workbook.xml.rels'),{open(node){if(node.local==='Relationship'){const attrs=node.attributes;relationships.set(attrs.Id?.value,{target:attrs.Target?.value,type:attrs.Type?.value,external:attrs.TargetMode?.value==='External'});}}});
   onProgress({stage:'worksheets-discovered',worksheetCount:sheets.length});
   if(entries.has('xl/styles.xml')) {let inCellXfs=false;await xml(entries.get('xl/styles.xml'),{open(node){if(!MAIN.has(node.uri))return;if(node.local==='numFmt')formats.set(+node.attributes.numFmtId?.value,node.attributes.formatCode?.value);if(node.local==='cellXfs')inCellXfs=true;if(node.local==='xf'&&inCellXfs){const id=+node.attributes.numFmtId?.value;dateStyles.push(builtInDate(id)||dateFormat(formats.get(id)||''));}},close(node){if(node.local==='cellXfs')inCellXfs=false;}},'styleSheet');}
-  const strings=new Strings(directory);
+  const strings=new Strings(directory,timings);
   try {
     if(entries.has('xl/sharedStrings.xml')) {let value='',inText=false,phonetic=0;await xml(entries.get('xl/sharedStrings.xml'),{open(node){if(!MAIN.has(node.uri))return;if(node.local==='si')value='';if(node.local==='rPh')phonetic++;if(node.local==='t'&&!phonetic)inText=true;},text(text){if(inText)value+=text;if(value.length>1024*1024)throw limit();},close(node){if(node.local==='t')inText=false;if(node.local==='rPh')phonetic--;if(node.local==='si')strings.add(value);}},'sst');}
     for(let sheetIndex=0;sheetIndex<sheets.length;sheetIndex++) {
+      strings.worksheetIndex=sheetIndex+1;
       const sheet=sheets[sheetIndex], rel=relationships.get(sheet.rel);
       if(!rel||rel.external||!rel.type?.endsWith('/worksheet'))throw new Error('Some declared worksheets could not be read. Invalid worksheet relationships.');
       const target=decodeURIComponent(rel.target||''), part=path.posix.normalize(target.startsWith('/')?target.slice(1):path.posix.join('xl',target));
       if(!part.startsWith('xl/worksheets/')||!part.endsWith('.xml'))throw new Error('Invalid XLSX worksheet relationship target.');
       onProgress({stage:'worksheet-processing',worksheetIndex:sheetIndex+1,worksheetCount:sheets.length});
-      const rawFile=path.join(directory,'rows.tmp'), writer=sink(rawFile), candidates=[];
+      const rawFile=path.join(directory,'rows.tmp'), writer=sink(rawFile,timings,sheetIndex+1), candidates=[];
       let row,cell,textTarget='',width=0,formulaCount=0,uncachedFormulas=0,rowNumber=0;
       try {await xml(entries.get(part),{
         open(node){if(!MAIN.has(node.uri))return;
@@ -133,7 +137,7 @@ export async function streamSpreadsheet(buffer,ext,directory,{onProgress=()=>{}}
           }
           if(node.local==='row'&&row){if(Object.keys(row.values).length||row.formulas){writer.write(row);if(candidates.length<25)candidates.push(row);}row=null;}
         }
-      },'worksheet');}finally{writer.close();}
+      },'worksheet',sheetIndex+1);}finally{writer.close();}
       await normalize({name:sheet.name,formulaCount,uncachedFormulas},rawFile,width,candidates);
     }
   } finally {strings.close();}

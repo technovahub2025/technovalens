@@ -465,7 +465,8 @@ async function receiveFile(req, res) {
   if (!req.file) return res.status(400).json({ error: "Please choose a PDF, XLSX or CSV file." });
   const ext = req.file.originalname.toLowerCase().split(".").pop();
   let processingStage = ext === "pdf" ? "pdf-extraction" : "spreadsheet-parsing";
-  let sheetDirectory, createdId, committed=false;
+  let sheetDirectory, createdId, metadataTemporaryPath, failureCode, committed=false;
+  const processingStarted=performance.now();
   const controller=new AbortController();
   const ensureConnected=()=>{if(controller.signal.aborted)throw Object.assign(new Error('Spreadsheet upload cancelled.'),{code:'PARSER_CANCELLED'});};
   const disconnected=()=>{if(!res.writableEnded)controller.abort();};
@@ -533,6 +534,8 @@ async function receiveFile(req, res) {
       response = { ...common, kind: "spreadsheet", ...workbookCounts(record), sheetName: first.name, sheetNames: sheets.map(s => s.name), rowCount: first.rowCount, columnCount: columns.length, columns, preview: first.preview,parserMetrics:sheets.metrics };
       response.analysis = record.analytics[0];
     }
+    const finalizationStarted=performance.now();
+    progress({stage:'finalizing',parserMetrics:record.parserMetrics});
     record.contentHash = record.kind === "spreadsheet"
       ? hashWorkbook(record.sheets)
       : crypto.createHash("sha256").update(JSON.stringify(record.chunks)).digest("hex");
@@ -541,15 +544,23 @@ async function receiveFile(req, res) {
     processingStage = 'document-storage';
     const persistedPath = path.join(documentStorePath, `${fileId}.json`);
     const temporaryPath = `${persistedPath}.${process.pid}.tmp`;
+    metadataTemporaryPath=temporaryPath;
+    const metadataStarted=performance.now();
     fs.writeFileSync(temporaryPath, JSON.stringify(record), { encoding: "utf8", mode: 0o600 });
     fs.renameSync(temporaryPath, persistedPath);
     attachStoredSheets(record,documentStorePath);
     documents.set(fileId, record);
+    const metadataStorageMs=Math.round((performance.now()-metadataStarted)*100)/100;
+    const conversationStarted=performance.now();
     const conversation = await conversationStore.create(
   fileId,
   req.file.originalname
 );
     ensureConnected();
+    if(record.parserMetrics){
+      Object.assign(record.parserMetrics,{metadataStorageMs,conversationMs:Math.round((performance.now()-conversationStarted)*100)/100,finalizationMs:Math.round((performance.now()-finalizationStarted)*100)/100,processingMs:Math.round(performance.now()-processingStarted)});
+      console.info('Spreadsheet upload finalized:',JSON.stringify({jobId,parserMetrics:record.parserMetrics}));
+    }
     response.fileName = record.name;
     response.conversationId = conversation.id;
     console.info("Uploaded document stored:", { backendInstanceId, fileId, mapSize: documents.size, kind: record.kind });
@@ -558,6 +569,7 @@ async function receiveFile(req, res) {
     progress({stage:'completed',worksheetCount:record.sheets?.length,parserMetrics:record.parserMetrics});
     res.json(response);
   } catch (error) {
+    failureCode=error.code||'UPLOAD_FAILED';
     const invalidDocument = ["pdf-extraction", "csv-parsing", "xlsx-parsing"].includes(processingStage);
     console.error("Upload processing failed:", {
       stage: processingStage,
@@ -566,7 +578,7 @@ async function receiveFile(req, res) {
       errorName: error?.name || "Error",
       errorCode: error?.code || null
     });
-    progress({stage:'failed',errorCode:error.code||'UPLOAD_FAILED'});
+    progress({stage:'failed',errorCode:failureCode,parserMetrics:error.metrics});
     const status=error.code==='PARSER_BUSY'?429:invalidDocument?400:500;
     if(status===429)res.set('Retry-After','1');
     if(!res.destroyed)res.status(status).json({
@@ -578,7 +590,20 @@ async function receiveFile(req, res) {
   } finally {
     res.off('close',disconnected);
     if(jobId)uploadControllers.delete(jobId);
-    if(!committed&&createdId){documents.delete(createdId);clearSheetCache(createdId);if(sheetDirectory)fs.rmSync(sheetDirectory,{recursive:true,force:true});fs.rmSync(path.join(documentStorePath,`${createdId}.json`),{force:true});await conversationStore.deleteForFile(createdId).catch(()=>console.warn('Cancelled upload conversation cleanup failed.'));}
+    if(!committed){
+      const cleanupStarted=performance.now();
+      try{
+        const cleanup=[];
+        if(createdId){documents.delete(createdId);clearSheetCache(createdId);if(sheetDirectory)cleanup.push(()=>fs.rmSync(sheetDirectory,{recursive:true,force:true}));cleanup.push(()=>fs.rmSync(path.join(documentStorePath,`${createdId}.json`),{force:true}),()=>conversationStore.deleteForFile(createdId));}
+        if(metadataTemporaryPath)cleanup.push(()=>fs.rmSync(metadataTemporaryPath,{force:true}));
+        const outcomes=await Promise.allSettled(cleanup.map(action=>Promise.resolve().then(action)));
+        const failed=outcomes.find(outcome=>outcome.status==='rejected');if(failed)throw failed.reason;
+        progress({stage:'failed',errorCode:failureCode||'UPLOAD_FAILED',cleanupComplete:true,cleanupMs:Math.round((performance.now()-cleanupStarted)*100)/100});
+      }catch(cleanupError){
+        console.error('Upload cleanup failed:',{errorCode:cleanupError.code||'UPLOAD_CLEANUP_FAILED'});
+        progress({stage:'failed',errorCode:failureCode||'UPLOAD_FAILED',cleanupComplete:false,cleanupErrorCode:'UPLOAD_CLEANUP_FAILED'});
+      }
+    }
   }
 }
 let receivingUploads=0;

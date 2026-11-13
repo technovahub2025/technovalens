@@ -20,7 +20,7 @@ if (!isMainThread) {
   const outputDir=process.argv.includes('--disk')?mkdtempSync(path.join(os.tmpdir(),'technovalens-benchmark-')):undefined;
   const buffer=readFileSync(filename), started=performance.now();
   let peakRss=process.memoryUsage().rss,peakHeap=0, outcome;
-  const worker=new Worker(new URL(import.meta.url),{workerData:{buffer,ext:'xlsx',legacy:process.argv.includes('--legacy'),outputDir},resourceLimits:{maxOldGenerationSizeMb:256}});
+  const worker=new Worker(new URL(import.meta.url),{workerData:{buffer,ext:'xlsx',legacy:process.argv.includes('--legacy'),outputDir,startedNs:process.hrtime.bigint()},resourceLimits:{maxOldGenerationSizeMb:256}});
   const timer=setInterval(()=>{peakRss=Math.max(peakRss,process.memoryUsage().rss);},10);
   worker.on('message',message=>{
     if(message.type==='benchmark-memory'){peakHeap=Math.max(peakHeap,message.heapUsed);peakRss=Math.max(peakRss,message.rss);}

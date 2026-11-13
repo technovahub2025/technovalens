@@ -430,8 +430,10 @@ export default function App() {
           if(!progressActive)return;
           const index=data.worksheetIndex||0,count=data.worksheetCount||0;
           if(data.stage==='worksheets-discovered')setProcessStage(`Discovered ${count} worksheets`);
-          if(data.stage==='worksheet-processing'||data.stage==='worksheet-parsed')setProcessStage(`Processing worksheet ${index} of ${count}`);
-          if(data.stage==='worksheet-analyzed')setProcessStage(`Analyzing worksheet ${index} of ${count}`);
+          if(data.stage==='worksheet-processing'||data.stage==='worksheet-parsed'||data.stage==='worksheet-loading')setProcessStage(`Processing worksheet ${index} of ${count}`);
+          if(data.stage==='worksheet-storage')setProcessStage(`Saving worksheet ${index} of ${count}`);
+          if(data.stage==='worksheet-analysis'||data.stage==='worksheet-analyzed')setProcessStage(`Analyzing worksheet ${index} of ${count}`);
+          if(data.stage==='finalizing')setProcessStage('Saving analysis');
         }catch{/* Progress can begin after the multipart body reaches the backend. */}
       },500);
       const { data } = await api.post(
@@ -439,6 +441,7 @@ export default function App() {
         body,
         {
           params:{job},signal:uploadController.signal,
+          timeout:0, // The bounded backend worker deadline owns processing timeouts.
           onUploadProgress: event => {
             const percent = event.total
               ? Math.round(event.loaded * 100 / event.total)
