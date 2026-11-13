@@ -55,6 +55,16 @@ In a second terminal run `npm run dev` in `frontend`. Production verification: `
 
 This application has no account login. File access is isolated by a random private browser workspace token, sent as `X-Workspace-Token`; the backend stores only its SHA-256 hash. File lists, previews, analytics, reports, chat and conversation access all check ownership. Keep the token private. Clearing browser storage loses access to that browser's uploads; this is browser workspace isolation, not account authentication or cross-device sign-in.
 
+All frontend requests now use `src/api.js`: one dedicated Axios client for upload, lists, previews, Analytics, Chat and blob report downloads, plus a fetch wrapper for streamed Chat. Both obtain the same token from `src/workspace.js` before sending a request. The existing `technovalens.workspaceToken` storage key is retained, so valid existing workspace identities survive this update. If storage is blocked or changes during a session, requests stop with an explanatory message; the app never silently creates a temporary identity or retries an upload under a different identity. Report downloads send the token in a header and download the returned blob; tokens are never added to download URLs.
+
+#### Deploying frontend and backend together
+
+The live frontend at `https://technovahub.in/technovalens` currently points to `https://technovalens.onrender.com`. Set `VITE_API_URL=https://technovalens.onrender.com` in the frontend **build environment**, run `npm ci` and `npm run build` in `frontend`, and deploy the generated `dist` contents under `/technovalens/`. A trailing `/api` is accepted and normalized. Without this setting, production uses same-origin `/api`, which requires a reverse proxy to the backend. Never use `http://localhost:5000` as the backend of the public HTTPS frontend: that addresses the visitor's computer. Local development uses Vite's `/api` proxy and defaults to port 5000.
+
+Deploy the backend source from the same revision and restart it. Preserve its document/conversation storage and do not change existing ownership hashes. `/api/health` now advertises `workspaceAuth: { version: 1, header: "X-Workspace-Token" }`. Keep `https://technovahub.in` allowed by CORS, including the `X-Workspace-Token` request header. Missing or invalid tokens still return HTTP 401 before upload processing, with the additive code `WORKSPACE_TOKEN_REQUIRED`.
+
+After deployment, reload the frontend without clearing site storage. In DevTools, check the failed request's URL and whether its request headers contain `X-Workspace-Token` (do not share its value). A direct browser navigation to a protected API URL does not attach this header and is expected to return 401. A stale open tab can still run an older frontend bundle; changing build environment variables requires rebuilding, not just restarting the backend. Tests in `backend/tests/workspace.test.js` and `workspace-api.test.js` cover identity initialization, refresh, blocked storage, isolation, actual upload/analytics/chat requests and PDF/XLSX downloads.
+
 Older uploads have no recorded owner, so the server cannot safely show them to every browser. Their stored data is preserved. Re-upload them, or have the server administrator assign legacy uploads from a **single known owner**:
 
 1. Open the app in that owner's browser. In its developer console, read `localStorage.getItem('technovalens.workspaceToken')`.
@@ -80,7 +90,41 @@ Implementation: `frontend/src/AnalyticsReports.jsx`, `frontend/src/workspace.js`
 
 An optional `backend/tests/browser-smoke.mjs` checks upload, Recharts, filtering, report PDF downloads, selection persistence and mobile overflow. With Playwright installed locally (or `PLAYWRIGHT_MODULE` pointing to an existing installation), run `node backend/tests/browser-smoke.mjs` from the project root. It requires port 5173 to be free, starts isolated servers, and deletes its temporary data afterward.
 
+### Local upload diagnostics
+
+`node --watch` enables Node dependency-reporting messages on worker threads. Spreadsheet parsing uses a typed result message and ignores those notifications; the first worker message is not necessarily a parsed workbook. This prevents a valid workbook from being incorrectly rejected as having no worksheets during `npm run dev`.
+
+Parser logs contain stages, archive byte size, normalization counts, worksheet row/column counts and error codes, without cell values, raw XML, filenames or workspace tokens. Standard Microsoft Excel OOXML bypasses normalization unchanged; only affected prefixed parts are rewritten. Upload/list/detail responses include additive `worksheets: [{ name, rowCount, columnCount }]` metadata, while existing first-sheet `rowCount` and `columnCount` fields keep their meanings.
+
+To inspect a workbook and perform an authenticated multipart upload through the local Vite proxy, run from `backend`:
+
+```powershell
+node diagnose-spreadsheet.mjs 'C:/Users/Admin/Downloads/TECHNOVALENS_Sample_Business_Data.xlsx' http://localhost:5173
+```
+
+The command compares raw ExcelJS loading, compatibility preparation, direct parsing and worker parsing. It reports upload status, worksheet counts, Analytics for every sheet and both report downloads. It uses a fresh private diagnostic workspace, never prints its token and removes its test upload afterward. Both backend (`npm run dev`, port 5000) and frontend (`npm run dev`, port 5173) must be running. The development proxy defaults to `http://localhost:5000`; a frontend `.env` setting can override it.
+
 ## AI usage controls
+
+### Large production workbooks
+
+XLSX uploads now read ZIP entries and worksheet XML incrementally. The parser reads values and cached formula results without constructing ExcelJS workbook/cell/style objects. Shared strings use a temporary disk index with a bounded cache; number formats needed for dates are retained, and decorative styles/media are skipped. Namespace-aware XML parsing supports prefixed OOXML directly, without rebuilding worksheet XML. Fully formatted empty rows/cells do not become data. Headers are detected among the first 25 populated rows, with title rows excluded and date/subheader combinations retained; each worksheet records its selected `headerRow` for review. Automatic header detection is heuristic, so review the selected headers for unfamiliar layouts.
+
+New uploads use `storageVersion: 2` metadata and a sibling `<fileId>.sheets` directory of normalized NDJSON files. Parsing and analysis process one worksheet at a time and cache exact unfiltered summaries. Only metadata, summaries and ten preview rows per sheet cross the worker boundary. Filtering, paginated previews and exports run in bounded workers using normalized data, without reparsing the XLSX. XLSX exports commit rows to the output ZIP incrementally. Temporary exports are removed after download. Original JSON uploads remain readable; back up both metadata files and their sibling sheet directories for new uploads.
+
+The original **256 MiB old-generation worker heap**, **30-second timeout**, **50 MiB upload limit**, **128 MiB expanded ZIP limit**, **32 sheets**, **100,000 data rows**, **256 populated columns** and **2,000,000 cells** remain enforced. `SPREADSHEET_WORKER_HEAP_MB` is clamped to 128–512 MiB (default 256), `SPREADSHEET_WORKERS` to 1–2 (default 1), and `SPREADSHEET_TIMEOUT_MS` to 1,000–120,000 ms (default 30,000). The same worker admission limit covers parsing and worksheet queries; at most eight lightweight worksheet queries may wait. Excess uploads receive 429. Timeouts, browser cancellation and disconnects terminate workers and clean up incomplete uploads. A worker heap cap is not a cap on total process RSS: buffers, native ZIP memory and the Express process also consume memory.
+
+The existing upload UI polls private `/api/files/upload-status/:job` status for worksheet discovery, processing and analysis, and offers cancellation. Job identifiers are not credentials; the workspace header is required for every status request. Completed jobs include parser elapsed time and sampled peak heap/RSS measurements. Logs contain counts/stages rather than cell contents or tokens.
+
+Local validation (no deployment):
+
+```powershell
+cd backend
+node benchmark-parser.mjs 'C:/Users/Admin/Downloads/EVEREADY PRODUCTION TRACKER -31.10.2026.xlsx' --disk
+node validate-large-workbook.mjs 'C:/Users/Admin/Downloads/EVEREADY PRODUCTION TRACKER -31.10.2026.xlsx' http://localhost:5173
+```
+
+The real-workbook validator compares worksheet row counts and numeric sums against an independent XML reader, checks filters/pagination and exports the largest worksheet, then repeats authenticated uploads three times. It removes its private diagnostic uploads afterward. Use `diagnose-spreadsheet.mjs` for small workbooks only: its raw ExcelJS comparison intentionally exercises the old full-document loading path.
 
 - Deterministic spreadsheet operations (totals, averages, extrema, row/column counts, missing and duplicate values, category totals, basic trends, and IQR outlier flags) are calculated locally.
 - Gemini receives compact column statistics and up to 30 relevant rows per selected sheet instead of the full workbook. Broad recommendations requests return one structured analysis response.

@@ -1,6 +1,6 @@
-import { workspaceHeaders } from "./workspace.js";
+import { workspaceFailureMessage } from "./workspace.js";
+import { api, apiFetch } from "./api.js";
 import { useEffect, useMemo, useRef, useState } from "react";
-import axios from "axios";
 import {
   Activity, BarChart3, Bot, ChevronDown, CircleHelp, CloudUpload,
   FileSpreadsheet, FileText, Files, LayoutDashboard,
@@ -12,6 +12,7 @@ import {
   Tooltip, XAxis, YAxis
 } from "recharts";
 import AnalyticsReports from "./AnalyticsReports.jsx";
+import { validateFileMetadata, validateUpload, fileDimensions } from "./api-contracts.js";
 
 // =====================================================
 // API CONFIGURATION
@@ -20,8 +21,6 @@ import AnalyticsReports from "./AnalyticsReports.jsx";
 // Production: VITE_API_URL=https://your-render-service.onrender.com
 // Development: Uses Vite's /api proxy.
 
-const API_BASE = (import.meta.env.DEV ? "" : import.meta.env.VITE_API_URL || "").replace(/\/+$/, "");
-const API = `${API_BASE}/api`;
 const MAX_UPLOAD_SIZE = 50 * 1024 * 1024;
 
 // =====================================================
@@ -29,6 +28,8 @@ const MAX_UPLOAD_SIZE = 50 * 1024 * 1024;
 // =====================================================
 
 function apiErrorMessage(error, fallback = "The request could not be completed.") {
+  const workspaceMessage = workspaceFailureMessage(error);
+  if (workspaceMessage) return workspaceMessage;
   const response = error?.response;
   const status = error?.apiStatus || response?.status;
 
@@ -65,6 +66,7 @@ function apiErrorMessage(error, fallback = "The request could not be completed."
   }
 
   if (status === 429) {
+    if(response?.data?.code==='PARSER_BUSY')return message||'Spreadsheet processing is busy. Please retry shortly.';
     return "Gemini is rate-limited. Please wait a moment and try again.";
   }
 
@@ -74,10 +76,6 @@ function apiErrorMessage(error, fallback = "The request could not be completed."
 
   if ([400, 404, 422].includes(status)) {
     return message || "The backend rejected this request. Check the API route and request details.";
-  }
-
-  if (status === 401) {
-    return "Backend authentication failed. Check your API key configuration.";
   }
 
   if (status === 403) {
@@ -173,6 +171,7 @@ export default function App() {
 
   const inputRef = useRef(null);
   const busyRef = useRef(false);
+  const uploadControllerRef = useRef(null);
   const openSequenceRef = useRef(0);
 
   const columns = useMemo(
@@ -188,8 +187,8 @@ export default function App() {
 
   async function refreshPersistentLists() {
     const [filesResponse, chatsResponse] = await Promise.all([
-      axios.get(`${API}/files`),
-      axios.get(`${API}/conversations`)
+      api.get(`/files`),
+      api.get(`/conversations`)
     ]);
 
     const files = Array.isArray(filesResponse.data)
@@ -200,6 +199,7 @@ export default function App() {
       ? chatsResponse.data
       : [];
 
+    files.forEach(validateFileMetadata);
     setDocuments(files);
     setConversations(chats);
 
@@ -220,8 +220,8 @@ export default function App() {
 
     try {
       const [chatResponse, fileResponse] = await Promise.all([
-        axios.get(`${API}/conversations/${conversation.id}`),
-        axios.get(`${API}/files/${conversation.fileId}`)
+        api.get(`/conversations/${conversation.id}`),
+        api.get(`/files/${conversation.fileId}`)
       ]);
 
       if (sequence !== openSequenceRef.current) return;
@@ -230,7 +230,7 @@ export default function App() {
       const document = fileResponse.data;
 
       setCurrentConversationId(chat.id);
-      setFileInfo(document);
+      setFileInfo(validateFileMetadata(document));
       setFile(null);
       setPreview(Array.isArray(document.preview) ? document.preview : []);
 
@@ -287,7 +287,7 @@ export default function App() {
       );
 
       if (!chat) {
-        const created = await axios.post(`${API}/conversations`, {
+        const created = await api.post(`/conversations`, {
           fileId: document.fileId,
           title: document.fileName
         });
@@ -318,8 +318,8 @@ export default function App() {
     async function initializeWorkspace() {
       try {
         const [filesResponse, chatsResponse] = await Promise.all([
-          axios.get(`${API}/files`),
-          axios.get(`${API}/conversations`)
+          api.get(`/files`),
+          api.get(`/conversations`)
         ]);
 
         if (cancelled) return;
@@ -351,12 +351,12 @@ export default function App() {
         if (selected) {
           await restoreConversation(selected);
         } else if (files[0]) {
-          const detailResponse = await axios.get(
-            `${API}/files/${files[0].fileId}`
+          const detailResponse = await api.get(
+            `/files/${files[0].fileId}`
           );
 
           if (!cancelled) {
-            setFileInfo(detailResponse.data);
+            setFileInfo(validateFileMetadata(detailResponse.data));
             setPreview(
               Array.isArray(detailResponse.data.preview)
                 ? detailResponse.data.preview
@@ -418,12 +418,27 @@ export default function App() {
 
     const body = new FormData();
     body.append("file", selected);
+    const job=crypto.randomUUID();
+    const uploadController=new AbortController();uploadController.jobId=job;uploadControllerRef.current=uploadController;
+    let progressPoll,progressActive=true;
 
     try {
-      const { data } = await axios.post(
-        `${API}/files/upload`,
+      if(extension!=='pdf')progressPoll=setInterval(async()=>{
+        if(!progressActive)return;
+        try{
+          const {data}=await api.get(`/files/upload-status/${job}`,{signal:uploadController.signal});
+          if(!progressActive)return;
+          const index=data.worksheetIndex||0,count=data.worksheetCount||0;
+          if(data.stage==='worksheets-discovered')setProcessStage(`Discovered ${count} worksheets`);
+          if(data.stage==='worksheet-processing'||data.stage==='worksheet-parsed')setProcessStage(`Processing worksheet ${index} of ${count}`);
+          if(data.stage==='worksheet-analyzed')setProcessStage(`Analyzing worksheet ${index} of ${count}`);
+        }catch{/* Progress can begin after the multipart body reaches the backend. */}
+      },500);
+      const { data } = await api.post(
+        `/files/upload`,
         body,
         {
+          params:{job},signal:uploadController.signal,
           onUploadProgress: event => {
             const percent = event.total
               ? Math.round(event.loaded * 100 / event.total)
@@ -432,12 +447,13 @@ export default function App() {
             setProgress(percent);
 
             if (percent >= 100) {
-              setProcessStage("Extracting text");
+              setProcessStage(extension==='pdf'?"Extracting text":"Discovering worksheets");
             }
           }
         }
       );
 
+      validateUpload(data);
       setFileInfo(data);
       setFile(selected);
       if (data.kind === "spreadsheet") {
@@ -485,7 +501,7 @@ export default function App() {
 
     } catch (error) {
       setNotice(
-        apiErrorMessage(
+        error.code==='ERR_CANCELED'?'Upload cancelled.':apiErrorMessage(
           error,
           "Upload failed. Check the backend connection."
         )
@@ -494,6 +510,7 @@ export default function App() {
       setProcessStage("");
 
     } finally {
+      progressActive=false;clearInterval(progressPoll);uploadController.abort();uploadControllerRef.current=null;
       busyRef.current = false;
       setBusy(false);
     }
@@ -506,8 +523,8 @@ export default function App() {
   async function removeFile() {
     if (fileInfo?.fileId) {
       try {
-        await axios.delete(
-          `${API}/files/${fileInfo.fileId}`
+        await api.delete(
+          `/files/${fileInfo.fileId}`
         );
       } catch (error) {
         setNotice(
@@ -587,8 +604,8 @@ export default function App() {
       }
 
       if (!retryRequest) {
-        await axios.post(
-          `${API}/conversations/${currentConversationId}/messages`,
+        await api.post(
+          `/conversations/${currentConversationId}/messages`,
           {
             role: "user",
             text: q
@@ -607,14 +624,13 @@ export default function App() {
       // -----------------------------------------------
 
       try {
-        const response = await fetch(
-          `${API}/ai/ask/progress`,
+        const response = await apiFetch(
+          `/ai/ask/progress`,
           {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
-              Accept: "text/event-stream",
-              ...workspaceHeaders
+              Accept: "text/event-stream"
             },
             body: JSON.stringify({
               fileId: requestFileId,
@@ -743,8 +759,8 @@ export default function App() {
         setProcessStage("Analysing document");
 
         try {
-          const { data } = await axios.post(
-            `${API}/ai/ask`,
+          const { data } = await api.post(
+            `/ai/ask`,
             {
               fileId: requestFileId,
               question: q
@@ -804,8 +820,8 @@ export default function App() {
         answerMessage
       ]);
 
-      await axios.post(
-        `${API}/conversations/${currentConversationId}/messages`,
+      await api.post(
+        `/conversations/${currentConversationId}/messages`,
         answerMessage
       ).catch(() => {
         setNotice(
@@ -841,8 +857,8 @@ export default function App() {
       ]);
 
       if (currentConversationId) {
-        axios.post(
-          `${API}/conversations/${currentConversationId}/messages`,
+        api.post(
+          `/conversations/${currentConversationId}/messages`,
           errorMessage
         ).catch(() => {});
       }
@@ -867,7 +883,7 @@ export default function App() {
     {
       label: "Total records",
       value:
-        fileInfo?.rowCount ??
+        fileInfo?.totalRowCount ?? fileInfo?.rowCount ??
         (fileInfo?.pageCount
           ? `${fileInfo.pageCount} pages`
           : "—"),
@@ -1148,7 +1164,7 @@ export default function App() {
                   </div>
 
                   <span className="status-pill">
-                    <i /> Ready
+                    <i /> {fileInfo ? "Ready" : "Upload a file"}
                   </span>
 
                 </div>
@@ -1263,9 +1279,7 @@ export default function App() {
                     <b>{safeText(fileInfo.fileName)}</b>
 
                     <p>
-                      {fileInfo.kind === "pdf"
-                        ? `${fileInfo.pageCount} pages`
-                        : `${fileInfo.rowCount} rows · ${fileInfo.columnCount} columns`}
+                      {fileDimensions(fileInfo)}
                     </p>
 
                     {fileInfo.kind === "spreadsheet" && (
@@ -1363,10 +1377,11 @@ export default function App() {
 
                     <small>
                       {safeText(processStage)}{" "}
-                      {progress > 0 ? `${progress}%` : ""}
+                      {processStage==='Uploading file' && progress > 0 ? `${progress}%` : ""}
                     </small>
                   </div>
                 )}
+                {busy && uploadControllerRef.current && <button type="button" className="secondary-button" onClick={()=>{const controller=uploadControllerRef.current;if(!controller)return;api.delete(`/files/upload-status/${controller.jobId}`).catch(()=>{});controller.abort();}}>Cancel upload</button>}
 
               </div>
 
@@ -1401,9 +1416,7 @@ export default function App() {
                         </b>
 
                         <small>
-                          {document.kind === "pdf"
-                            ? `${document.pageCount} pages`
-                            : `${document.rowCount} rows · ${document.columnCount} columns`}
+                          {fileDimensions(document)}
                           {" · "}
                           {document.uploadedAt
                             ? new Date(document.uploadedAt).toLocaleDateString()
@@ -1456,9 +1469,7 @@ export default function App() {
                           ? `${(file.size / 1024).toFixed(1)} KB`
                           : "Uploaded"}
                         {" · "}
-                        {fileInfo.kind === "pdf"
-                          ? `${fileInfo.pageCount} pages`
-                          : `${fileInfo.rowCount} rows · ${fileInfo.columnCount} columns · ${safeText(fileInfo.sheetName)}`}
+                        {fileDimensions(fileInfo)}
                       </small>
 
                     </div>
@@ -1781,9 +1792,7 @@ export default function App() {
                       <b>{safeText(fileInfo.fileName)}</b>
 
                       <small>
-                        {fileInfo.kind === "pdf"
-                          ? `${fileInfo.pageCount} pages`
-                          : `${fileInfo.rowCount} rows · ${fileInfo.columnCount} columns`}
+                        {fileDimensions(fileInfo)}
                       </small>
 
                     </div>

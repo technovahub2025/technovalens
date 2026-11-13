@@ -1,9 +1,11 @@
 import { useEffect, useState } from "react";
 import axios from "axios";
+import { api } from "./api.js";
+import { workspaceFailureMessage } from "./workspace.js";
+import { validateAnalysis, validatePreview } from "./api-contracts.js";
 import { Activity, BarChart3, CalendarDays, ChevronLeft, ChevronRight, Download, FileSpreadsheet, Filter, LoaderCircle, Search, Sparkles, Table2 } from "lucide-react";
 import { Bar, BarChart, CartesianGrid, Cell, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
-const API = `${(import.meta.env.DEV ? "" : import.meta.env.VITE_API_URL || "").replace(/\/+$/, "")}/api`;
 const colors = ["#8052d6", "#4385f5", "#19b8a6", "#ff9a55", "#ed6aaf", "#6d6ae8", "#4bb9da"];
 const number = value => value == null ? "?" : new Intl.NumberFormat("en", { maximumFractionDigits: 2 }).format(value);
 const read = (key, fallback) => { try { return JSON.parse(localStorage.getItem(key)) || fallback; } catch { return fallback; } };
@@ -35,18 +37,18 @@ function WorkbookView({ page, workbook, workbooks, onSelect }) {
   const queryKey = JSON.stringify(query);
   useEffect(() => {
     const controller = new AbortController(); setLoading(true); setSummary(null); setError("");
-    axios.get(`${API}/analytics/${workbook.fileId}`, { params: query, signal: controller.signal })
-      .then(({ data }) => { setSummary(data); setSchema(data); })
-      .catch(err => { if (!axios.isCancel(err)) setError(err.response?.data?.error || "Could not analyze this workbook. Try again."); })
+    api.get(`/analytics/${workbook.fileId}`, { params: query, signal: controller.signal })
+      .then(({ data }) => { validateAnalysis(data); setSummary(data); setSchema(data); })
+      .catch(err => { if (!axios.isCancel(err)) setError(workspaceFailureMessage(err) || err.response?.data?.error || err.message || "Could not analyze this workbook. Try again."); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
   }, [workbook.fileId, queryKey, retry]);
   useEffect(() => {
     if (isReport) return;
     const controller = new AbortController(); setTableLoading(true); setTable(null);
-    axios.get(`${API}/analytics/${workbook.fileId}/preview`, { params: { ...query, page: pageNo, pageSize: 12, sort, direction }, signal: controller.signal })
-      .then(({ data }) => { setTable(data); if (data.page !== pageNo) setPageNo(data.page); })
-      .catch(err => { if (!axios.isCancel(err)) setError(err.response?.data?.error || "Could not load the data preview."); })
+    api.get(`/analytics/${workbook.fileId}/preview`, { params: { ...query, page: pageNo, pageSize: 12, sort, direction }, signal: controller.signal })
+      .then(({ data }) => { validatePreview(data); setTable(data); if (data.page !== pageNo) setPageNo(data.page); })
+      .catch(err => { if (!axios.isCancel(err)) setError(workspaceFailureMessage(err) || err.response?.data?.error || err.message || "Could not load the data preview."); })
       .finally(() => { if (!controller.signal.aborted) setTableLoading(false); });
     return () => controller.abort();
   }, [workbook.fileId, queryKey, pageNo, sort, direction, isReport, retry]);
@@ -54,14 +56,14 @@ function WorkbookView({ page, workbook, workbooks, onSelect }) {
   async function download(format) {
     setExporting(format); setError("");
     try {
-      const response = await axios.get(`${API}/reports/${workbook.fileId}.${format}`, { params: query, responseType: "blob" });
+      const response = await api.get(`/reports/${workbook.fileId}.${format}`, { params: query, responseType: "blob" });
       const url = URL.createObjectURL(response.data), link = document.createElement("a");
       link.href = url; link.download = `${workbook.fileName.replace(/\.[^.]+$/, "")}-report.${format}`;
       document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (err) {
       let message = "Could not export this report. Please try again.";
       if (err.response?.data instanceof Blob) { try { message = JSON.parse(await err.response.data.text()).error || message; } catch { /* Use fallback. */ } }
-      setError(message);
+      setError(workspaceFailureMessage(err) || message);
     } finally { setExporting(""); }
   }
   return <div className="insights-page" aria-busy={pending}>

@@ -5,13 +5,17 @@ export function normalizeQuestion(question) {
 }
 
 export function hashWorkbook(sheets) {
-  const normalized = sheets.map(sheet => ({
-    name: String(sheet.name || ""),
-    rows: sheet.rows.map(row => Object.fromEntries(Object.entries(row)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(([key, value]) => [key, value instanceof Date ? value.toISOString() : value])))
-  }));
-  return crypto.createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
+  const hash=crypto.createHash('sha256');
+  for(const sheet of sheets){
+    const part=crypto.createHash('sha256');
+    if(sheet.contentHash)hash.update(sheet.contentHash);
+    else {
+      part.update(String(sheet.name||''));
+      for(const row of sheet.rows)part.update(JSON.stringify(Object.fromEntries(Object.entries(row).sort(([a],[b])=>a.localeCompare(b)))));
+      hash.update(part.digest('hex'));
+    }
+  }
+  return hash.digest('hex');
 }
 
 export function parseNumeric(value) {
@@ -43,13 +47,15 @@ export function filterDataset(sheet, options = {}) {
   const columns = sheet.columns || Object.keys(sheet.rows[0] || {});
   const search = String(options.search || "").trim().toLocaleLowerCase();
   const categoryColumn = columns.includes(options.categoryColumn) ? options.categoryColumn : "";
+  if(!search&&(!categoryColumn||options.categoryValue===undefined||options.categoryValue===''))return sheet.rows;
   return sheet.rows.filter(row => (!search || columns.some(c => String(row[c] ?? "").toLocaleLowerCase().includes(search))) &&
     (!categoryColumn || options.categoryValue === undefined || options.categoryValue === "" || groupValue(row[categoryColumn]) === options.categoryValue));
 }
 
 export function previewDataset(sheet, options = {}) {
   const columns = sheet.columns || Object.keys(sheet.rows[0] || {});
-  const rows = filterDataset(sheet, options);
+  let rows = filterDataset(sheet, options);
+  if(columns.includes(options.sort))rows=rows.slice();
   if (columns.includes(options.sort)) rows.sort((a, b) => {
     const left = a[options.sort], right = b[options.sort];
     const ln = parseNumeric(left), rn = parseNumeric(right);
@@ -66,14 +72,14 @@ export function analyzeDataset(sheet, options = {}) {
   const columns = sheet.columns || Object.keys(sheet.rows[0] || {});
   const rows = filterDataset(sheet, options);
   const profile = source => Object.fromEntries(columns.map(column => {
-    const present = source.map(row => row[column]).filter(v => !isBlank(v));
-    const numeric = present.map(parseNumeric).filter(v => v !== null);
-    const unique = new Set(present.map(v => String(v))).size;
-    const type = !present.length ? 'text' : present.filter(dateLike).length / present.length >= .8 ? 'date' : numeric.length / present.length >= .8 ? 'numeric' : unique <= Math.min(30, Math.max(2, Math.ceil(present.length * .25))) ? 'category' : 'text';
+    let present=0,numeric=0,dates=0;const values=new Set();
+    for(const row of source){const value=row[column];if(isBlank(value))continue;present++;if(parseNumeric(value)!==null)numeric++;if(dateLike(value))dates++;values.add(String(value));}
+    const unique=values.size;
+    const type = !present ? 'text' : dates / present >= .8 ? 'date' : numeric / present >= .8 ? 'numeric' : unique <= Math.min(30, Math.max(2, Math.ceil(present * .25))) ? 'category' : 'text';
     return [column, { type, unique }];
   }));
   // Detect types from the full sheet, so filtering does not change chart columns.
-  const schema = profile(sheet.rows);
+  const schema = sheet.analytics?.columnStats ? Object.fromEntries(columns.map(column=>[column,{type:sheet.analytics.columnStats[column].type,unique:sheet.analytics.columnStats[column].unique}])) : profile(sheet.rows);
   const columnStats = Object.fromEntries(columns.map(column => {
     let missing = 0, numericCount = 0, sum = 0, min = Infinity, max = -Infinity, invalid = 0;
     const unique = new Set(); const type = schema[column].type;
@@ -88,9 +94,9 @@ export function analyzeDataset(sheet, options = {}) {
     return [column, { type, count: rows.length, missing, unique: unique.size, invalid, numericCount, sum: numericCount ? sum : null, average: numericCount ? sum / numericCount : null, min: numericCount ? min : null, max: numericCount ? max : null }];
   }));
   const seen = new Set(); let duplicateRows = 0;
-  for (const row of rows) { const key = JSON.stringify(columns.map(c => isBlank(row[c]) ? null : row[c])); if (seen.has(key)) duplicateRows++; else seen.add(key); }
+  for (const row of rows) { const key = crypto.createHash('sha256').update(JSON.stringify(columns.map(c => isBlank(row[c]) ? null : row[c]))).digest('hex'); if (seen.has(key)) duplicateRows++; else seen.add(key); }
   // Options always come from the original data, so a filtered value can be changed.
-  const categories = Object.fromEntries(columns.filter(c => ['category', 'text'].includes(schema[c].type)).map(c => [c, [...new Set(sheet.rows.map(r => groupValue(r[c])))].slice(0, 200)]));
+  const categories = sheet.analytics?.categories || Object.fromEntries(columns.filter(c => ['category', 'text'].includes(schema[c].type)).map(c => {const values=new Set();for(const row of sheet.rows){values.add(groupValue(row[c]));if(values.size===200)break;}return [c,[...values]];}));
   const numeric = columns.filter(c => schema[c].type === 'numeric');
   const category = columns.filter(c => schema[c].type === 'category');
   const dates = columns.filter(c => schema[c].type === 'date');
@@ -113,6 +119,7 @@ export function analyzeDataset(sheet, options = {}) {
   for (const { column } of kpis) { const s = columnStats[column]; if (s.numericCount) findings.push(`${column}: average ${s.average.toLocaleString('en', { maximumFractionDigits: 4 })}; range ${s.min} to ${s.max} (${s.numericCount} numeric values).`); }
   if (grouped[0]) findings.push(`${grouped[0].name} is the largest ${groupColumn} group: ${grouped[0].count} records (${rows.length ? (grouped[0].count / rows.length * 100).toFixed(1) : 0}%).`);
   const warnings = [];
+  if(sheet.headerRow>1) warnings.push(`Headers detected on Excel row ${sheet.headerRow}; preceding title/blank rows are excluded from records.`);
   if (sheet.formulaCount) warnings.push(`${sheet.formulaCount} formula cells: cached results only; formulas were not recalculated. ${sheet.uncachedFormulas || 0} cells without cached results are missing.`);
   const invalidValues = Object.values(columnStats).reduce((n, s) => n + s.invalid, 0);
   if (invalidValues) warnings.push(`${invalidValues} values do not match their inferred numeric/date column type and are excluded from those calculations.`);

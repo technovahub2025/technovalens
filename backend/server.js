@@ -3,8 +3,9 @@ import cors from "cors";
 import multer from "multer";
 import dotenv from "dotenv";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { parseSpreadsheetInWorker } from "./spreadsheet-parser.js";
-import { createExcelReport, createPdfReport } from "./reports.js";
+import { parseSpreadsheetInWorker, querySpreadsheetInWorker, validateSheets, parserLimits } from "./spreadsheet-parser.js";
+import { attachStoredSheets, clearSheetCache } from './sheet-storage.js';
+import { pipeline } from 'node:stream/promises';
 import { FileConversationStore } from "./storage/file-conversation-store.js";
 import { GoogleGenAI } from "@google/genai";
 import crypto from "crypto";
@@ -71,9 +72,9 @@ const workspaceContext = new AsyncLocalStorage();
 const owns = document => Boolean(document && document.ownerHash === workspaceContext.getStore());
 app.use('/api', (req, res, next) => {
   if (['/health', '/usage'].includes(req.path) || req.method === 'OPTIONS') return next();
-  const token = req.get('X-Workspace-Token') || '';
-  if (!/^[a-f0-9]{64}$/.test(token)) return res.status(401).json({ error: 'A private workspace token is required. Reload the application.' });
   res.set('Cache-Control', 'no-store');
+  const token = req.get('X-Workspace-Token') || '';
+  if (!/^[a-f0-9]{64}$/.test(token)) return res.status(401).json({ error: 'A private workspace token is required. Reload the application.', code: 'WORKSPACE_TOKEN_REQUIRED' });
   const hash = crypto.createHash('sha256').update(token).digest('hex');
   req.ownerHash = hash;
   workspaceContext.run(hash, () => next());
@@ -125,6 +126,8 @@ for (const entry of fs.readdirSync(documentStorePath, { withFileTypes: true })) 
   if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
   try {
     const document = JSON.parse(fs.readFileSync(path.join(documentStorePath, entry.name), "utf8"));
+    attachStoredSheets(document,documentStorePath);
+    validateStoredDocument(document);
     if (typeof document.fileId === "string") documents.set(document.fileId, document);
   } catch (error) {
     console.warn("Skipping unreadable persisted document:", { file: entry.name, errorName: error?.name || "Error" });
@@ -139,13 +142,42 @@ function getDocument(fileId, { reload = false } = {}) {
   if ((!document || reload) && typeof fileId === "string") {
     try {
       document = JSON.parse(fs.readFileSync(path.join(documentStorePath, `${fileId}.json`), "utf8"));
+      attachStoredSheets(document,documentStorePath);
+      validateStoredDocument(document);
       if (document.fileId === fileId) documents.set(fileId, document);
       else document = undefined;
     } catch (error) {
+      document = undefined;
       if (error?.code !== "ENOENT") console.warn("Persisted document lookup failed:", { fileId, errorName: error?.name || "Error" });
     }
   }
   return owns(document) ? document : undefined;
+}
+
+function validateStoredDocument(document) {
+  if (!document || !['spreadsheet', 'pdf'].includes(document.kind)) throw new Error('Invalid stored document.');
+  if (document.kind === 'spreadsheet') {
+    validateSheets(document.sheets);
+    const first = document.sheets[0];
+    if(document.storageVersion===2){
+      if(document.sheetName!==first.name||!Array.isArray(document.columns)||!document.sheets.every(sheet=>sheet.analytics&&Array.isArray(sheet.preview)))throw new Error('Stored spreadsheet metadata is incomplete.');
+      return;
+    }
+    if (!Array.isArray(document.rows) || !Array.isArray(document.columns) || document.rows.length !== first.rows.length ||
+        JSON.stringify(document.columns) !== JSON.stringify(first.columns) || document.sheetName !== first.name) {
+      throw new Error('Stored spreadsheet metadata is incomplete. Upload the original workbook again.');
+    }
+  } else if (!Array.isArray(document.chunks) || !Number.isInteger(document.pageCount) || document.pageCount < 1) {
+    throw new Error('Stored PDF metadata is incomplete.');
+  }
+}
+
+function workbookCounts(document) {
+  return {
+    sheetCount: document.sheets.length,
+    totalRowCount: document.sheets.reduce((count, sheet) => count + (sheet.rowCount??sheet.rows.length), 0),
+    worksheets: document.sheets.map(sheet => ({ name: sheet.name, rowCount: sheet.rowCount??sheet.rows.length, columnCount: sheet.columns.length, headerRow: sheet.headerRow||1 }))
+  };
 }
 
 function describeDocument(document) {
@@ -162,13 +194,13 @@ function describeDocument(document) {
     };
   }
   const primarySheet = document.sheets[0];
-  const preview = primarySheet?.rows.slice(0, 10) || [];
+  const preview = primarySheet?.preview || primarySheet?.rows.slice(0, 10) || [];
   return {
     fileId: document.fileId, name: document.name, fileName: document.name,
     type: document.type, size: document.size, uploadedAt: document.uploadedAt,
-    kind: document.kind, sheetName: document.sheetName,
+    kind: document.kind, sheetName: document.sheetName, ...workbookCounts(document),
     sheetNames: document.sheets.map(sheet => sheet.name),
-    rowCount: document.rows.length, columnCount: document.columns.length,
+    rowCount: document.rowCount??document.rows.length, columnCount: document.columns.length,
     columns: document.columns, preview
   };
 }
@@ -184,9 +216,9 @@ function listDocumentMetadata(document) {
   return {
     fileId: document.fileId, fileName: document.name, name: document.name,
     type: document.type, size: document.size, uploadedAt: document.uploadedAt,
-    kind: document.kind, sheetName: document.sheetName,
+    kind: document.kind, sheetName: document.sheetName, ...workbookCounts(document),
     sheetNames: document.sheets.map(sheet => sheet.name),
-    rowCount: document.rows.length, columnCount: document.columns.length
+    rowCount: document.rowCount??document.rows.length, columnCount: document.columns.length
   };
 }
 function readJsonFile(filePath, fallback) {
@@ -227,7 +259,7 @@ const MAX_GEMINI_CONCURRENCY = 1;
 let activeGeminiRequests = 0;
 let lastGeminiRequestAt = 0;
 const geminiWaiters = [];
-app.get("/api/health", (_req, res) => res.json({ status: "ok", app: "TECHNOVALENS API" }));
+app.get("/api/health", (_req, res) => res.json({ status: "ok", app: "TECHNOVALENS API", workspaceAuth: { version: 1, header: "X-Workspace-Token" } }));
 app.get("/api/usage", (_req, res) => {
   rollUsageDay();
   res.json({
@@ -414,10 +446,36 @@ function waitBeforeRetry(delayMs, signal) {
   });
 }
 
+const uploadJobs=new Map();
+const uploadControllers=new Map();
+app.delete('/api/files/upload-status/:job',(req,res)=>{
+  const job=uploadJobs.get(req.params.job),running=uploadControllers.get(req.params.job);
+  if(!job||job.ownerHash!==req.ownerHash)return res.status(404).json({error:'Upload progress not found in this workspace.'});
+  if(!running)return res.status(409).json({error:'This upload is no longer processing.'});
+  running.abort();res.status(202).json({stage:'cancelling'});
+});
+app.get('/api/files/upload-status/:job', (req,res)=>{
+  const job=uploadJobs.get(req.params.job);
+  if(!job||job.ownerHash!==req.ownerHash)return res.status(404).json({error:'Upload progress not found in this workspace.'});
+  const {ownerHash,...progress}=job;
+  const memory=process.memoryUsage();
+  res.json({...progress,memory:{rssMiB:+(memory.rss/1048576).toFixed(1),heapMiB:+(memory.heapUsed/1048576).toFixed(1),peakRssMiB:+(process.resourceUsage().maxRSS/1024).toFixed(1)}});
+});
 async function receiveFile(req, res) {
   if (!req.file) return res.status(400).json({ error: "Please choose a PDF, XLSX or CSV file." });
   const ext = req.file.originalname.toLowerCase().split(".").pop();
   let processingStage = ext === "pdf" ? "pdf-extraction" : "spreadsheet-parsing";
+  let sheetDirectory, createdId, committed=false;
+  const controller=new AbortController();
+  const ensureConnected=()=>{if(controller.signal.aborted)throw Object.assign(new Error('Spreadsheet upload cancelled.'),{code:'PARSER_CANCELLED'});};
+  const disconnected=()=>{if(!res.writableEnded)controller.abort();};
+  res.on('close',disconnected);
+  const jobId=/^[a-f0-9-]{36}$/i.test(req.query.job||'')?req.query.job:null;
+  if(jobId&&uploadControllers.has(jobId))return res.status(409).json({error:'This upload job is already processing.'});
+  if(jobId)uploadControllers.set(jobId,controller);
+  if(uploadJobs.size>=1000)uploadJobs.delete(uploadJobs.keys().next().value);
+  const progress=details=>{if(jobId)uploadJobs.set(jobId,{...uploadJobs.get(jobId),ownerHash:req.ownerHash,...Object.fromEntries(Object.entries(details).filter(([,v])=>v!==undefined)),updatedAt:new Date().toISOString()});};
+  progress({stage:'processing'});
   try {
     if (ext === "pdf" && req.file.buffer.subarray(0, 5).toString("ascii") !== "%PDF-") {
       return res.status(400).json({ error: "This file is not a valid PDF. Check the file and try again." });
@@ -426,6 +484,7 @@ async function receiveFile(req, res) {
       return res.status(400).json({ error: "This file is not a valid XLSX workbook. Check the file and try again." });
     }
     const fileId = crypto.randomUUID();
+    createdId=fileId;
     const common = { ownerHash: req.ownerHash, fileId, name: req.file.originalname, type: ext.toUpperCase(), size: req.file.size, uploadedAt: new Date().toISOString() };
     let record, response;
     if (ext === "pdf") {
@@ -463,35 +522,40 @@ async function receiveFile(req, res) {
       } finally { await parser?.destroy?.().catch?.(() => {}); }
     } else {
       processingStage = ext === 'csv' ? 'csv-parsing' : 'xlsx-parsing';
-      const sheets = await parseSpreadsheetInWorker(req.file.buffer, ext);
+      sheetDirectory=path.join(documentStorePath,`${fileId}.sheets`);
+      fs.mkdirSync(sheetDirectory,{mode:0o700});
+      const sheets = validateSheets(await parseSpreadsheetInWorker(req.file.buffer, ext,{outputDir:sheetDirectory,signal:controller.signal,onProgress:progress}));
       const first = sheets[0];
       if (!first) return res.status(400).json({ error: "No worksheets found in this file." });
       const columns = first.columns;
-      const { text: aiContext, truncated: aiContextTruncated } = buildSpreadsheetAiContext(sheets);
-      record = { ...common, kind: "spreadsheet", sheets, sheetName: first.name, rows: first.rows, columns, aiContext, aiContextTruncated };
-      response = { ...common, kind: "spreadsheet", sheetName: first.name, sheetNames: sheets.map(s => s.name), rowCount: first.rows.length, columnCount: columns.length, columns, preview: first.rows.slice(0, 10) };
-      // Analyze each worksheet immediately; keep summaries bounded and omit raw rows.
-      record.analytics = sheets.map(sheet => {
-        const { filteredRows, ...summary } = analyzeDataset(sheet);
-        return summary;
-      });
+      record = { ...common, kind: "spreadsheet", storageVersion:2,sheets, sheetName: first.name, rowCount:first.rowCount,columns, aiContext:'',aiContextTruncated:true,parserMetrics:sheets.metrics };
+      record.analytics=sheets.map(sheet=>sheet.analytics);
+      response = { ...common, kind: "spreadsheet", ...workbookCounts(record), sheetName: first.name, sheetNames: sheets.map(s => s.name), rowCount: first.rowCount, columnCount: columns.length, columns, preview: first.preview,parserMetrics:sheets.metrics };
       response.analysis = record.analytics[0];
     }
     record.contentHash = record.kind === "spreadsheet"
       ? hashWorkbook(record.sheets)
       : crypto.createHash("sha256").update(JSON.stringify(record.chunks)).digest("hex");
+    ensureConnected();
+    validateStoredDocument(record);
+    processingStage = 'document-storage';
     const persistedPath = path.join(documentStorePath, `${fileId}.json`);
     const temporaryPath = `${persistedPath}.${process.pid}.tmp`;
     fs.writeFileSync(temporaryPath, JSON.stringify(record), { encoding: "utf8", mode: 0o600 });
     fs.renameSync(temporaryPath, persistedPath);
+    attachStoredSheets(record,documentStorePath);
     documents.set(fileId, record);
     const conversation = await conversationStore.create(
   fileId,
   req.file.originalname
 );
+    ensureConnected();
+    response.fileName = record.name;
     response.conversationId = conversation.id;
     console.info("Uploaded document stored:", { backendInstanceId, fileId, mapSize: documents.size, kind: record.kind });
     delete response.ownerHash;
+    committed=true;
+    progress({stage:'completed',worksheetCount:record.sheets?.length,parserMetrics:record.parserMetrics});
     res.json(response);
   } catch (error) {
     const invalidDocument = ["pdf-extraction", "csv-parsing", "xlsx-parsing"].includes(processingStage);
@@ -502,16 +566,31 @@ async function receiveFile(req, res) {
       errorName: error?.name || "Error",
       errorCode: error?.code || null
     });
-    res.status(invalidDocument ? 400 : 500).json({
+    progress({stage:'failed',errorCode:error.code||'UPLOAD_FAILED'});
+    const status=error.code==='PARSER_BUSY'?429:invalidDocument?400:500;
+    if(status===429)res.set('Retry-After','1');
+    if(!res.destroyed)res.status(status).json({
+      code:error.code||'UPLOAD_FAILED',
       error: invalidDocument
         ? (ext === "pdf" ? "Could not extract text from this PDF. Check that it is readable and try again." : `Could not read this spreadsheet: ${String(error.message).slice(0, 240)}`)
         : "The server could not process this upload. Check the backend logs and try again."
     });
+  } finally {
+    res.off('close',disconnected);
+    if(jobId)uploadControllers.delete(jobId);
+    if(!committed&&createdId){documents.delete(createdId);clearSheetCache(createdId);if(sheetDirectory)fs.rmSync(sheetDirectory,{recursive:true,force:true});fs.rmSync(path.join(documentStorePath,`${createdId}.json`),{force:true});await conversationStore.deleteForFile(createdId).catch(()=>console.warn('Cancelled upload conversation cleanup failed.'));}
   }
 }
-app.post("/api/files/upload", upload.single("file"), receiveFile);
+let receivingUploads=0;
+function admitUpload(_req,res,next){
+  if(receivingUploads>=parserLimits.concurrency){res.set('Retry-After','1');return res.status(429).json({code:'PARSER_BUSY',error:'Another upload is processing. Please retry shortly.'});}
+  receivingUploads++;let released=false;
+  const release=()=>{if(!released){released=true;receivingUploads--;}};
+  res.once('finish',release);res.once('close',release);next();
+}
+app.post("/api/files/upload", admitUpload,upload.single("file"), receiveFile);
 // Keep the original Excel upload URL working for existing clients; it now accepts CSV too.
-app.post("/api/excel/upload", upload.single("file"), receiveFile);
+app.post("/api/excel/upload", admitUpload,upload.single("file"), receiveFile);
 app.get("/api/files", (_req, res) => {
   const list = [...documents.values()].filter(owns).map(listDocumentMetadata).sort((a, b) => b.uploadedAt.localeCompare(a.uploadedAt));
   res.json(list);
@@ -623,10 +702,11 @@ app.delete("/api/conversations/:id", async (req, res) => {
 });
 
 app.get("/api/excel/files", (_req, res) => res.json([...documents.values()].filter(d => owns(d) && d.kind === "spreadsheet").map(d => ({ fileId: d.fileId, fileName: d.name, sheetName: d.sheetName, rowCount: d.rows.length, columnCount: d.columns.length }))));
-function getSheetRequest(req, res) {
+function getSheetRequest(req, res, {loadRows=true}={}) {
   const doc = getDocument(req.params.id);
   if (!doc || doc.kind !== 'spreadsheet') { res.status(404).json({ error: 'Workbook not found in this workspace.' }); return null; }
-  const sheet = req.query.sheet ? doc.sheets.find(s => s.name === req.query.sheet) : doc.sheets[0];
+  const metadata = req.query.sheet ? doc.sheets.find(s => s.name === req.query.sheet) : doc.sheets[0];
+  const sheet=metadata?(loadRows&&doc.storageVersion!==2?{...metadata,rows:metadata.rows}:metadata):null;
   if (!sheet) { res.status(400).json({ error: 'Worksheet not found. Select an existing worksheet.' }); return null; }
   return { doc, sheet };
 }
@@ -635,36 +715,49 @@ function reportStats(sheet, query) {
   stats.filters = Object.fromEntries(['search', 'categoryColumn', 'categoryValue'].filter(key => query[key]).map(key => [key, query[key]]));
   return stats;
 }
-app.get('/api/analytics/:id', (req, res) => {
-  const request = getSheetRequest(req, res); if (!request) return;
+async function sheetTask(req,res,{doc,sheet},mode,exportPath){
+  const controller=new AbortController();const close=()=>{if(!res.writableEnded)controller.abort();};res.on('close',close);
+  try{return await querySpreadsheetInWorker({mode,sheet:{...sheet},filename:path.join(documentStorePath,`${doc.fileId}.sheets`,sheet.dataFile),options:req.query,document:{name:doc.name,sheets:doc.sheets.map(s=>({name:s.name}))},exportPath},{signal:controller.signal});}
+  finally{res.off('close',close);}
+}
+app.get('/api/analytics/:id', async (req, res,next) => {
+  try{
+  const request = getSheetRequest(req, res,{loadRows:false}); if (!request) return;
   const { doc, sheet } = request;
   const cached = !req.query.search && !req.query.categoryValue && doc.analytics?.find(s => s.sheetName === sheet.name);
-  const { filteredRows, ...summary } = cached || reportStats(sheet, req.query);
+  const { filteredRows, ...summary } = cached || (doc.storageVersion===2?await sheetTask(req,res,request,'analysis'):reportStats({...sheet,rows:sheet.rows}, req.query));
   res.json({ fileId: doc.fileId, fileName: doc.name, uploadedAt: doc.uploadedAt, generatedAt: new Date().toISOString(), sheetCount: doc.sheets.length, sheetNames: doc.sheets.map(s => s.name), ...summary });
+  }catch(error){next(error);}
 });
-app.get('/api/analytics/:id/preview', (req, res) => {
+app.get('/api/analytics/:id/preview', async (req, res,next) => {
+  try{
   const request = getSheetRequest(req, res); if (!request) return;
-  res.json(previewDataset(request.sheet, req.query));
+  res.json(request.doc.storageVersion===2?await sheetTask(req,res,request,'preview'):previewDataset(request.sheet, req.query));
+  }catch(error){next(error);}
 });
 app.get('/api/reports/:id.xlsx', async (req, res, next) => {
   const request = getSheetRequest(req, res); if (!request) return;
+  let exportPath;
   try {
     const { doc, sheet } = request;
-    const workbook = createExcelReport(doc, sheet, reportStats(sheet, req.query), new Date().toISOString());
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(doc.name.replace(/\.[^.]+$/, ''))}-report.xlsx"`);
-    await workbook.xlsx.write(res); res.end();
+    if(doc.storageVersion===2){exportPath=path.join(documentStorePath,`${doc.fileId}.sheets`,`report-${crypto.randomUUID()}.xlsx`);await sheetTask(req,res,request,'xlsx',exportPath);await pipeline(fs.createReadStream(exportPath),res);}
+    else{const {writeExcelReport}=await import('./reports.js');await writeExcelReport(res,doc,sheet,reportStats(sheet,req.query),new Date().toISOString());res.end();}
   } catch (error) { if (res.headersSent) res.destroy(); else next(error); }
+  finally{if(exportPath)fs.rmSync(exportPath,{force:true});}
 });
-app.get('/api/reports/:id.pdf', (req, res, next) => {
+app.get('/api/reports/:id.pdf', async (req, res, next) => {
   const request = getSheetRequest(req, res); if (!request) return;
+  let exportPath;
   try {
     const { doc, sheet } = request;
-    const pdf = createPdfReport(doc, sheet, reportStats(sheet, req.query), new Date().toISOString());
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(doc.name.replace(/\.[^.]+$/, ''))}-report.pdf"`);
-    pdf.on('error', () => res.destroy()); pdf.pipe(res); pdf.end();
+    if(doc.storageVersion===2){exportPath=path.join(documentStorePath,`${doc.fileId}.sheets`,`report-${crypto.randomUUID()}.pdf`);await sheetTask(req,res,request,'pdf',exportPath);await pipeline(fs.createReadStream(exportPath),res);}
+    else{const {createPdfReport}=await import('./reports.js');const pdf=createPdfReport(doc,sheet,reportStats(sheet,req.query),new Date().toISOString());pdf.on('error',()=>res.destroy());pdf.pipe(res);pdf.end();}
   } catch (error) { if (res.headersSent) res.destroy(); else next(error); }
+  finally{if(exportPath)fs.rmSync(exportPath,{force:true});}
 });
 app.get("/api/excel/:id/preview", (req, res) => {
   const doc = getDocument(req.params.id);
@@ -682,6 +775,8 @@ app.delete("/api/files/:id", async (req, res) => {
     }
   }
   documents.delete(req.params.id);
+  clearSheetCache(req.params.id);
+  if(document.storageVersion===2)fs.rmSync(path.join(documentStorePath,`${document.fileId}.sheets`),{recursive:true,force:true});
   await conversationStore.deleteForFile(req.params.id);
   res.json({ status: "removed" });
 });
@@ -1200,6 +1295,12 @@ app.post("/api/ai/ask/progress", async (req, res) => {
   }
 });
 app.use((err, _req, res, _next) => {
+  if(res.destroyed)return;
+  if(err.code?.startsWith('PARSER_')||err.code==='ERR_WORKER_OUT_OF_MEMORY'){
+    const status=err.code==='PARSER_BUSY'?429:err.code==='PARSER_TIMEOUT'?408:422;
+    if(status===429)res.set('Retry-After','1');
+    return res.status(status).json({error:err.message,code:err.code});
+  }
   const fileSizeLimit = err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE";
   const unsupportedType = err?.code === "UNSUPPORTED_FILE_TYPE";
   const mimeMismatch = err?.code === "MIME_TYPE_MISMATCH";

@@ -39,6 +39,20 @@ export function createExcelReport(doc, sheet, stats, generatedAt) {
   return workbook;
 }
 
+export async function writeExcelReport(stream,doc,sheet,stats,generatedAt) {
+  const template=createExcelReport(doc,sheet,{...stats,filteredRows:[]},generatedAt);
+  const writer=new ExcelJS.stream.xlsx.WorkbookWriter({stream,useStyles:true,useSharedStrings:false});
+  writer.creator='TECHNOVALENS';writer.created=new Date(generatedAt);
+  for(const source of template.worksheets){
+    const target=writer.addWorksheet(source.name,{views:source.views,pageSetup:source.pageSetup});
+    target.columns=source.columns.map(column=>({width:column.width}));
+    source.eachRow(row=>{const output=target.addRow(row.values.slice(1));output.height=row.height;row.eachCell((cell,index)=>{output.getCell(index).style=cell.style;});output.commit();});
+    if(source.name==='Selected Data')for(const row of stats.filteredRows)target.addRow(stats.columns.map(column=>row[column]??null)).commit();
+    target.commit();
+  }
+  await writer.commit();
+}
+
 export function createPdfReport(doc, sheet, stats, generatedAt) {
   const pdf = new PDFDocument({ size: 'A4', margin: 42, bufferPages: true, info: { Title: `${doc.name} — dataset report`, Author: 'TECHNOVALENS' } });
   const width = 511; let y = 42;
