@@ -43,22 +43,41 @@ async function provisionAndLogin(actor,input={}){
   assert.equal(loggedIn.response.status,200);
   return {...loggedIn,data:{...loggedIn.data,recoveryCodes:record.recoveryCodes},credentials};
 }
+async function signupAccount(actor,input={}){
+  await actor.bootstrap();const credentials={username:username(),password:password(),...input};
+  return {...await actor.json('/auth/signup',{...credentials,confirmPassword:credentials.password}),credentials};
+}
 
-test('public signup is disabled; provisioned passwords use Argon2id and login rotates session/CSRF tokens',async()=>{
+test('public signup validates credentials, hashes passwords with Argon2id and rotates session/CSRF tokens',async()=>{
   const f=await fixture();try{
     const actor=f.browser();await actor.bootstrap();const anonymous=actor.cookie,oldCsrf=actor.csrf;
     const credentials={username:username(),password:password()};
-    assert.equal((await actor.json('/auth/signup',{...credentials,confirmPassword:credentials.password})).response.status,403);
+    assert.equal((await actor.json('/auth/signup',{...credentials,password:'short',confirmPassword:'short'})).response.status,400);
+    assert.equal((await actor.json('/auth/signup',{...credentials,confirmPassword:'mismatch'})).response.status,400);
+    assert.equal((await actor.json('/auth/signup',{...credentials,username:{$ne:null},confirmPassword:credentials.password})).response.status,400);
     assert.equal(await f.db.collection('auth_users').countDocuments(),0);
     await assert.rejects(createStoredAccount(f.db,{...credentials,password:'short'}),{code:'VALIDATION_ERROR'});
-    const created=await provisionAndLogin(actor,credentials);assert.equal(created.response.status,200);assert.equal(created.data.recoveryCodes.length,10);assert.notEqual(actor.cookie,anonymous);assert.notEqual(actor.csrf,oldCsrf);
-    const record=await f.db.collection('auth_users').findOne({_id:created.data.user.id});assert.match(record.passwordHash,/^\$argon2id\$v=19\$m=19456,t=2,p=1\$/);assert.equal(await argon2.verify(record.passwordHash,credentials.password),true);assert.ok(!JSON.stringify(record).includes(credentials.password));assert.ok(!JSON.stringify(record).includes(created.data.recoveryCodes[0]));assert.equal('passwordHash' in created.data,false);
+    const created=await actor.json('/auth/signup',{...credentials,confirmPassword:credentials.password,role:'admin',initialAdmin:true,ownerHash:'forged',_id:'forged'});assert.equal(created.response.status,201);assert.notEqual(actor.cookie,anonymous);assert.notEqual(actor.csrf,oldCsrf);
+    const record=await f.db.collection('auth_users').findOne({_id:created.data.user.id});assert.match(record.passwordHash,/^\$argon2id\$v=19\$m=19456,t=2,p=1\$/);assert.equal(await argon2.verify(record.passwordHash,credentials.password),true);assert.ok(!JSON.stringify(record).includes(credentials.password));assert.equal(record.recoveryHashes.length,10);assert.equal(record.role,undefined);assert.equal(record.initialAdmin,undefined);assert.notEqual(record._id,'forged');assert.deepEqual(Object.keys(created.data).sort(),['csrfToken','user']);
     const cookie=created.response.headers.getSetCookie().join(';');assert.match(cookie,/HttpOnly/);assert.match(cookie,/SameSite=Lax/);assert.match(cookie,/Path=\//);
     assert.equal((await rawFetch(f.base+'/private',{headers:{Cookie:anonymous}})).status,401);
-    const duplicate=f.browser();await duplicate.bootstrap();await assert.rejects(createStoredAccount(f.db,{...credentials,username:credentials.username.toUpperCase()}),{code:'USERNAME_UNAVAILABLE'});
+    const duplicate=f.browser();await duplicate.bootstrap();assert.equal((await duplicate.json('/auth/signup',{...credentials,username:credentials.username.toUpperCase(),confirmPassword:credentials.password})).response.status,409);
     assert.equal((await duplicate.json('/auth/login',{username:{$ne:null},password:credentials.password})).response.status,401);
     const wrong=await duplicate.json('/auth/login',{username:credentials.username,password:password()}),unknown=await duplicate.json('/auth/login',{username:username(),password:password()});assert.equal(wrong.response.status,401);assert.deepEqual(wrong.data,unknown.data);
     assert.equal(passwordError('Password123456789'),'Choose a less predictable password that does not contain your username.');
+  }finally{await f.close();}
+});
+
+test('signup requires CSRF and trusted origins, rate limits attempts and rejects concurrent duplicate usernames',async()=>{
+  const f=await fixture({limits:{signupIp:2}});try{
+    const a=f.browser(),b=f.browser();await a.bootstrap();await b.bootstrap();
+    const input={username:username(),password:password()};input.confirmPassword=input.password;
+    assert.equal((await rawFetch(f.base+'/auth/signup',{method:'POST',headers:{Cookie:a.cookie,'Content-Type':'application/json'},body:JSON.stringify(input)})).status,403);
+    assert.equal((await a.request('/auth/signup',{method:'POST',headers:{Origin:'https://evil.example','Content-Type':'application/json'},body:JSON.stringify(input)})).status,403);
+    assert.equal(await f.db.collection('auth_users').countDocuments(),0);
+    const results=await Promise.all([a,b].map(actor=>actor.json('/auth/signup',input)));
+    assert.deepEqual(results.map(result=>result.response.status).sort(),[201,409]);assert.equal(await f.db.collection('auth_users').countDocuments(),1);
+    const limited=await b.json('/auth/signup',{...input,username:username()});assert.equal(limited.response.status,429);assert.ok(limited.response.headers.get('Retry-After'));
   }finally{await f.close();}
 });
 
@@ -204,7 +223,7 @@ test('real MongoDB/GridFS endpoints enforce account ownership and never adopt ex
     const preflight=await rawFetch(base+'/auth/login',{method:'OPTIONS',headers:{Origin:'https://technovahub.in','Access-Control-Request-Method':'POST','Access-Control-Request-Headers':'Content-Type,X-CSRF-Token'}});assert.equal(preflight.status,204);assert.match(preflight.headers.get('Access-Control-Allow-Headers'),/X-CSRF-Token/i);
     const rejectedOrigin=await rawFetch(base+'/health',{headers:{Origin:'https://technovahub.in.attacker.example'}});assert.equal(rejectedOrigin.headers.get('Access-Control-Allow-Origin'),null);
     for(const route of ['/files','/conversations','/usage','/reports/'+crypto.randomUUID()+'.xlsx'])assert.equal((await rawFetch(base+route,{headers:{'X-Workspace-Token':'a'.repeat(64)}})).status,401);
-    const a=browser(base,db),b=browser(base,db),first=await provisionAndLogin(a),second=await provisionAndLogin(b);assert.notEqual(first.data.user.id,second.data.user.id);
+    const a=browser(base,db),b=browser(base,db),first=await signupAccount(a),second=await signupAccount(b);assert.equal(first.response.status,201);assert.equal(second.response.status,201);assert.notEqual(first.data.user.id,second.data.user.id);
     const form=new FormData();form.append('file',new Blob(['Name,Revenue\nNorth,100\nSouth,50\n']),'private.csv');const uploaded=await a.request('/files/upload',{method:'POST',body:form});assert.equal(uploaded.status,200);const file=await uploaded.json();
     const record=await db.collection('documents').findOne({_id:file.fileId});assert.equal(record.ownerHash,accountOwner(first.data.user.id));for(const blob of await db.collection('document_data.files').find({'metadata.fileId':file.fileId}).toArray())assert.equal(blob.metadata.ownerHash,record.ownerHash);
     const diagnostic=await diagnosticClient(`http://127.0.0.1:${port}`,first.credentials);assert.equal((await diagnostic.request(`/files/${file.fileId}`)).status,200);await diagnostic.logout();assert.equal((await a.request(`/files/${file.fileId}`)).status,200,'diagnostic logout does not invalidate another session');
@@ -218,7 +237,8 @@ test('real MongoDB/GridFS endpoints enforce account ownership and never adopt ex
     await fs.writeFile(path.join(directory,legacy.fileId+'.json'),JSON.stringify(legacy));const store=new MongoDocumentStore(db,directory);await store.save(legacy);
     assert.equal((await a.request(`/files/${legacy.fileId}`,{headers:{'X-Workspace-Token':'a'.repeat(64)}})).status,404);assert.equal((await db.collection('documents').findOne({_id:legacy.fileId})).ownerHash,legacy.ownerHash);assert.equal(await fs.readFile(path.join(directory,legacy.fileId+'.json'),'utf8'),JSON.stringify(legacy));
     assert.equal((await a.json('/ai/ask',{fileId:file.fileId,question:'total Revenue'})).data.calculation.value,150);
-    const recovery=first.data.recoveryCodes[0],replacement=password(),reset=browser(base);await reset.bootstrap();assert.equal((await reset.json('/auth/recover',{username:first.credentials.username,recoveryCode:recovery,password:replacement,confirmPassword:replacement})).response.status,200);
+    const issued=await a.json('/auth/recovery-codes',{password:first.credentials.password});assert.equal(issued.response.status,200);
+    const recovery=issued.data.recoveryCodes[0],replacement=password(),reset=browser(base);await reset.bootstrap();assert.equal((await reset.json('/auth/recover',{username:first.credentials.username,recoveryCode:recovery,password:replacement,confirmPassword:replacement})).response.status,200);
     const again=browser(base);await again.bootstrap();assert.equal((await again.json('/auth/login',{username:first.credentials.username,password:replacement})).response.status,200);assert.equal((await again.request(`/files/${file.fileId}`)).status,200,'recovery preserves account ownership');
   }finally{if(child.exitCode===null){const ended=once(child,'exit');child.kill();await ended;}await db.dropDatabase();await client.close();await fs.rm(directory,{recursive:true,force:true});}
 });

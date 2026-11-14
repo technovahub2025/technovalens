@@ -55,7 +55,7 @@ In a second terminal run `npm run dev` in `frontend`. Production verification: `
 
 ### Accounts, sessions and existing uploads
 
-The frontend opens on Admin Login with username and password. Public signup is disabled. For first-time setup, review the intended MongoDB connection, then run `npm run admin:setup` in a private interactive terminal inside `backend`. It securely prompts for an initial username (default `admin`) and strong password without echoing credentials, stores an Argon2id hash, and permanently locks bootstrap after claiming its singleton setup record. No account is created automatically at server startup. Existing accounts and their data remain intact. Under Settings > Account Security, change credentials or issue one-time recovery codes. See [authentication setup and verification](backend/authentication.md).
+The frontend opens on a centered Welcome Back card with username/password login and a Sign Up link. Signup requires a unique username, a strong password and confirmation, then opens a private workspace. Accounts use MongoDB and Argon2id; cookies, CSRF, rate limits and ownership checks remain enforced. Settings > Account Security supports credential changes with current-password verification. Recovery links and pages are absent from the UI; the protected recovery APIs remain available internally. Existing accounts and documents are preserved. Optional first-admin provisioning remains available through `npm run admin:setup` in a private interactive terminal after reviewing the intended database; its permanent singleton lock is unchanged. See [authentication setup and verification](backend/authentication.md).
 
 All document, upload/progress, chat, history, analytics and report endpoints require an authenticated account. The frontend Axios client and streaming fetch wrapper send credentials; session/CSRF secrets are never stored in localStorage or download URLs. Browser preferences are scoped by account ID. Logging out or changing accounts unmounts the old workspace.
 
@@ -84,7 +84,7 @@ All accept optional `sheet`, `search`, `categoryColumn` and `categoryValue`. Pre
 
 Implementation: `frontend/src/AnalyticsReports.jsx`, `frontend/src/workspace.js` and scoped additions in `styles.css`; integration in `App.jsx` and the local proxy default in `vite.config.js`. Backend changes are in `analytics.js`, `spreadsheet-parser.js`, `reports.js`, `server.js`, the optional `storage/file-conversation-store.js`, and `migrate-workspace.js`. Coverage lives in `backend/tests/analytics-reports.test.js`; the API suite uses isolated authenticated accounts.
 
-Run `node tests/run-tests.js --auth-ui` from `backend` for the isolated authenticated Edge browser smoke test, including desktop/mobile Admin Login, Account Security, username/password changes, upload, logout, recovery and restored document access. See the authentication guide for requirements. The older optional `tests/browser-smoke.mjs` predates account authentication.
+Run `node tests/run-tests.js --auth-ui` from `backend` for the isolated authenticated Edge browser smoke test, including centered desktop/mobile login and signup, Account Security, username/password changes, upload, refresh/session persistence, logout and restored document access. See the authentication guide for requirements. The older optional `tests/browser-smoke.mjs` predates account authentication.
 
 ### Local upload diagnostics
 

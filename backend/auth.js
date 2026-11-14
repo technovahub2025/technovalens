@@ -3,7 +3,7 @@ import session from 'express-session';
 import MongoStore from 'connect-mongo';
 import argon2 from 'argon2';
 import crypto from 'node:crypto';
-import {hashOptions,normalizeUsername,passwordError,recoveryCodes} from './credentials.js';
+import {hashOptions,normalizeUsername,passwordError,recoveryCodes,createStoredAccount} from './credentials.js';
 export {passwordError} from './credentials.js';
 
 const random=()=>crypto.randomBytes(32).toString('hex');
@@ -76,7 +76,16 @@ export async function createAuthentication({db,secret,allowedOrigins,production=
     if(!req.session)req.sessionStore.generate(req);
     res.json({user:user?publicUser(user):null,csrfToken:csrfToken(req)});
   }));
-  router.all('/auth/signup',(_req,res)=>res.status(403).json({code:'SIGNUP_DISABLED',error:'Public signup is disabled. Contact the application administrator.'}));
+  router.post('/auth/signup',csrf,asyncRoute(async(req,res)=>{
+    await rate(req,'signup');
+    const {username,password,confirmPassword}=req.body||{};
+    if(typeof password!=='string'||password!==confirmPassword)return res.status(400).json({code:'VALIDATION_ERROR',error:'Passwords do not match.'});
+    // Never accept roles, ownership or IDs from the signup request. The account
+    // creator validates strength and enforces case-insensitive uniqueness.
+    const {user}=await boundedHash(()=>createStoredAccount(db,{username,password}));
+    await establish(req,user);
+    res.status(201).json({user:publicUser(user),csrfToken:csrfToken(req)});
+  }));
   router.post('/auth/login',csrf,asyncRoute(async(req,res)=>{
     const key=normalizeUsername(req.body?.username);await rate(req,'login',key||'invalid');
     const user=key?await users.findOne({usernameKey:key}):null,password=req.body?.password;

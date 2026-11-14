@@ -23,6 +23,6 @@ try{
   reader.close();reader=null;
   client=new MongoClient(process.env.MONGODB_URI,{serverSelectionTimeoutMS:15000});await client.connect();
   await provisionInitialAdmin(client.db(process.env.MONGODB_DB_NAME?.trim()||'technovalens'),{username,password});
-  console.log('Initial administrator created. Bootstrap is permanently disabled. Sign in, then issue recovery codes under Settings > Account Security.');
+  console.log('Initial administrator created. Bootstrap is permanently disabled. Sign in and manage credentials under Settings > Account Security.');
 }catch(error){console.error(error.code==='VALIDATION_ERROR'?error.message:error.message?.startsWith('Use ')||error.message?.startsWith('Include ')||error.message?.startsWith('Choose ')?error.message:({MongoServerSelectionError:'Cannot connect to MongoDB.'}[error.name]||(/^(Run admin|Configure |Passwords do not|Initial administrator setup|This account already)/.test(error.message||'')?error.message:'Administrator setup failed. No credentials were printed. Inspect the database setup state before retrying.')));process.exitCode=1;}
 finally{reader?.close();await client?.close();}

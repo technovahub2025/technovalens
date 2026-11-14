@@ -14,7 +14,7 @@ export function recoveryCodes(id){
   return {codes,hashes:codes.map(code=>crypto.createHash('sha256').update(`${id}:${code.replace(/-/g,'').toLowerCase()}`).digest('hex'))};
 }
 
-// Internal provisioning only. No public HTTP route can invoke account creation.
+// Shared validated account creation for signup and explicit admin provisioning.
 export async function createStoredAccount(db,{username,password,initialAdmin=false}){
   const key=normalizeUsername(username),error=key?passwordError(password,key):'Use a username of 3–32 letters, numbers, dots, underscores or hyphens.';
   if(error)throw Object.assign(new Error(error),{code:'VALIDATION_ERROR',status:400});
