@@ -81,7 +81,7 @@ export async function createAuthentication({db,secret,allowedOrigins,production=
     const {username,password,confirmPassword}=req.body||{};
     if(typeof password!=='string'||password!==confirmPassword)return res.status(400).json({code:'VALIDATION_ERROR',error:'Passwords do not match.'});
     // Never accept roles, ownership or IDs from the signup request. The account
-    // creator validates strength and enforces case-insensitive uniqueness.
+    // creator requires a nonempty password and enforces username uniqueness.
     const {user}=await boundedHash(()=>createStoredAccount(db,{username,password}));
     await establish(req,user);
     res.status(201).json({user:publicUser(user),csrfToken:csrfToken(req)});

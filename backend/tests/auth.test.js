@@ -52,11 +52,11 @@ test('public signup validates credentials, hashes passwords with Argon2id and ro
   const f=await fixture();try{
     const actor=f.browser();await actor.bootstrap();const anonymous=actor.cookie,oldCsrf=actor.csrf;
     const credentials={username:username(),password:password()};
-    assert.equal((await actor.json('/auth/signup',{...credentials,password:'short',confirmPassword:'short'})).response.status,400);
+    assert.equal((await actor.json('/auth/signup',{...credentials,password:'',confirmPassword:''})).response.status,400);
     assert.equal((await actor.json('/auth/signup',{...credentials,confirmPassword:'mismatch'})).response.status,400);
     assert.equal((await actor.json('/auth/signup',{...credentials,username:{$ne:null},confirmPassword:credentials.password})).response.status,400);
     assert.equal(await f.db.collection('auth_users').countDocuments(),0);
-    await assert.rejects(createStoredAccount(f.db,{...credentials,password:'short'}),{code:'VALIDATION_ERROR'});
+    await assert.rejects(createStoredAccount(f.db,{...credentials,password:''}),{code:'VALIDATION_ERROR'});
     const created=await actor.json('/auth/signup',{...credentials,confirmPassword:credentials.password,role:'admin',initialAdmin:true,ownerHash:'forged',_id:'forged'});assert.equal(created.response.status,201);assert.notEqual(actor.cookie,anonymous);assert.notEqual(actor.csrf,oldCsrf);
     const record=await f.db.collection('auth_users').findOne({_id:created.data.user.id});assert.match(record.passwordHash,/^\$argon2id\$v=19\$m=19456,t=2,p=1\$/);assert.equal(await argon2.verify(record.passwordHash,credentials.password),true);assert.ok(!JSON.stringify(record).includes(credentials.password));assert.equal(record.recoveryHashes.length,10);assert.equal(record.role,undefined);assert.equal(record.initialAdmin,undefined);assert.notEqual(record._id,'forged');assert.deepEqual(Object.keys(created.data).sort(),['csrfToken','user']);
     const cookie=created.response.headers.getSetCookie().join(';');assert.match(cookie,/HttpOnly/);assert.match(cookie,/SameSite=Lax/);assert.match(cookie,/Path=\//);
@@ -64,7 +64,8 @@ test('public signup validates credentials, hashes passwords with Argon2id and ro
     const duplicate=f.browser();await duplicate.bootstrap();assert.equal((await duplicate.json('/auth/signup',{...credentials,username:credentials.username.toUpperCase(),confirmPassword:credentials.password})).response.status,409);
     assert.equal((await duplicate.json('/auth/login',{username:{$ne:null},password:credentials.password})).response.status,401);
     const wrong=await duplicate.json('/auth/login',{username:credentials.username,password:password()}),unknown=await duplicate.json('/auth/login',{username:username(),password:password()});assert.equal(wrong.response.status,401);assert.deepEqual(wrong.data,unknown.data);
-    assert.equal(passwordError('Password123456789'),'Choose a less predictable password that does not contain your username.');
+    for(const value of ['x','1','password',credentials.username,' ', 'a'.repeat(128)])assert.equal(passwordError(value,credentials.username),'');
+    for(const value of ['',null,123,'a'.repeat(129)])assert.ok(passwordError(value));
   }finally{await f.close();}
 });
 
@@ -154,7 +155,7 @@ test('Render proxy detection trusts only configured hops and never accepts spoof
 
 test('first administrator provisioning is explicit, singleton, permanently locked and preserves existing users',async()=>{
   const f=await fixture();try{
-    await assert.rejects(provisionInitialAdmin(f.db,{password:'admin123'}));assert.equal(await f.db.collection('auth_bootstrap').countDocuments(),0);
+    await assert.rejects(provisionInitialAdmin(f.db,{password:''}));assert.equal(await f.db.collection('auth_bootstrap').countDocuments(),0);
     const legacy=await createStoredAccount(f.db,{username:username(),password:password()});
     const saved=await f.db.collection('auth_users').findOne({_id:legacy.user._id});
     const results=await Promise.allSettled([provisionInitialAdmin(f.db,{username:'admin',password:password()}),provisionInitialAdmin(f.db,{username:'another_admin',password:password()})]);
@@ -186,7 +187,7 @@ test('account security verifies current password, validates changes and revokes 
     assert.equal((await rawFetch(f.base+'/auth/account',{method:'POST',headers:{Cookie:actor.cookie,'Content-Type':'application/json'},body:'{}'})).status,403);
     assert.equal((await actor.json('/auth/account',{currentPassword:'wrong',username:newUsername})).response.status,401);
     const input={currentPassword:created.credentials.password,username:newUsername,newPassword,confirmPassword:newPassword};
-    assert.equal((await actor.json('/auth/account',{...input,newPassword:'short',confirmPassword:'short'})).response.status,400);
+    assert.equal((await actor.json('/auth/account',{...input,newPassword:'a'.repeat(129),confirmPassword:'a'.repeat(129)})).response.status,400);
     assert.equal((await actor.json('/auth/account',{...input,confirmPassword:'mismatch'})).response.status,400);
     assert.equal((await actor.json('/auth/account',{...input,username:{$ne:null}})).response.status,400);
     assert.equal((await actor.json('/auth/account',{...input,newPassword:created.credentials.password,confirmPassword:created.credentials.password})).response.status,400);

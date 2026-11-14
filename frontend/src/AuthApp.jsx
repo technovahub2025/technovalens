@@ -54,9 +54,8 @@ export default function AuthApp(){
       setForm({...emptyForm,username:account.username});setMode('login');await refresh();setNotice('Account security updated. All previous sessions have ended. Log in again.');
     }catch(error){setError(message(error));}finally{setBusy(false);}
   }
-  const field=(name,label,type='text',autoComplete)=> <label className="auth-field" key={name}>{label}<input name={name} type={type} value={form[name]} autoComplete={autoComplete} autoCapitalize="none" spellCheck={false} required maxLength={name==='username'?32:128} minLength={name==='username'?3:name==='password'&&mode==='signup'?15:undefined} aria-describedby={name==='password'&&mode==='signup'?'signup-password-hint':undefined} onChange={event=>setForm({...form,[name]:event.target.value})}/></label>;
-  const accountField=(name,label,type='password',autoComplete='new-password',required=false)=> <label className="auth-field" key={name}>{label}<input name={name} type={type} value={account[name]} autoComplete={autoComplete} required={required} maxLength={name==='username'?32:128} minLength={name==='username'?3:name==='newPassword'?15:undefined} onChange={event=>setAccount({...account,[name]:event.target.value})}/></label>;
-  const meetsRules=account.newPassword.length>=15&&/[a-z]/.test(account.newPassword)&&/[A-Z]/.test(account.newPassword)&&/[0-9]/.test(account.newPassword)&&!account.newPassword.toLowerCase().includes(account.username.toLowerCase())&&!/^(?:password|letmein|qwerty|welcome|admin|technovalens)[\W\d_]*$/i.test(account.newPassword);
+  const field=(name,label,type='text',autoComplete)=> <label className="auth-field" key={name}>{label}<input name={name} type={type} value={form[name]} autoComplete={autoComplete} autoCapitalize="none" spellCheck={false} required maxLength={name==='username'?32:128} minLength={name==='username'?3:undefined} onChange={event=>setForm({...form,[name]:event.target.value})}/></label>;
+  const accountField=(name,label,type='password',autoComplete='new-password',required=false)=> <label className="auth-field" key={name}>{label}<input name={name} type={type} value={account[name]} autoComplete={autoComplete} required={required} maxLength={name==='username'?32:128} minLength={name==='username'?3:undefined} onChange={event=>setAccount({...account,[name]:event.target.value})}/></label>;
   if(user&&!manage)return <>{error&&<div className="auth-session-notice" role="alert">{error}</div>}<App key={user.id} authUser={user} onLogout={logout} onManageRecovery={()=>{setError('');setAccount({...emptyAccount,username:user.username});setManage(true);}}/></>;
   return <main className="auth-page">
     <section className="auth-form-side" aria-label={manage?'Account Security':mode==='signup'?'Sign Up':'Login'}><div className="auth-card">
@@ -67,15 +66,13 @@ export default function AuthApp(){
         <form onSubmit={updateAccount}>
           {accountField('username','Username','text','username',true)}{accountField('currentPassword','Current password','password','current-password',true)}
           {accountField('newPassword','New password (optional)')}{accountField('confirmPassword','Confirm new password','password','new-password',Boolean(account.newPassword))}
-          <small className="auth-password-hint">15–128 characters, including uppercase and lowercase letters and a number. Avoid your username.</small>
-          {account.newPassword&&<p className="auth-strength" role="status">{meetsRules?'Password requirements met.':'Choose a stronger password that meets all requirements.'}</p>}
-          <button className="auth-primary" disabled={busy||Boolean(account.newPassword&&!meetsRules)}>Save changes</button>
+          <button className="auth-primary" disabled={busy}>Save changes</button>
           <button type="button" className="auth-link" onClick={()=>{setManage(false);setAccount(emptyAccount);setError('');}}>Back to workspace</button>
         </form>
       </>:<>
         <h2>{mode==='signup'?'Create Account':'Welcome Back'}</h2>{mode==='login'&&<p className="auth-subtitle">Sign in to your account</p>}
         {notice&&<div className="auth-notice" role="status">{notice}</div>}{error&&<div className="auth-error" role="alert">{error}</div>}
-        <form onSubmit={submit}>{field('username','Username','text','username')}{field('password','Password','password',mode==='login'?'current-password':'new-password')}{mode==='signup'&&<><small id="signup-password-hint" className="auth-password-hint">15–128 characters, including uppercase and lowercase letters and a number. Avoid your username.</small>{field('confirmPassword','Confirm Password','password','new-password')}</>}
+        <form onSubmit={submit}>{field('username','Username','text','username')}{field('password','Password','password',mode==='login'?'current-password':'new-password')}{mode==='signup'&&field('confirmPassword','Confirm Password','password','new-password')}
           <button className="auth-primary" disabled={busy||!ready}>{busy?'Please wait…':mode==='signup'?'Create Account':'Login'}</button>
         </form>
         {!ready&&<div className="auth-connection" role="status">{error?<button className="auth-link" onClick={refresh}>Retry secure connection</button>:'Connecting securely…'}</div>}

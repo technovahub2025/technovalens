@@ -17,7 +17,7 @@ const output=path.join(backendDir,'.data/auth-validation');await fs.mkdir(output
 const children=[],client=new MongoClient(process.env.MONGODB_URI);let ws;
 const start=(command,args,options={})=>{const child=spawn(command,args,{windowsHide:true,stdio:'ignore',...options});children.push(child);return child;};
 try{
-  const username=`ui_${crypto.randomBytes(6).toString('hex')}`,password=`Ua7!${crypto.randomBytes(20).toString('hex')}`;
+  const username=`ui_${crypto.randomBytes(6).toString('hex')}`,password=String.fromCharCode(97+crypto.randomInt(26));
   start(process.execPath,['server.js'],{cwd:backendDir,env:{...process.env,PORT:String(backendPort),DOCUMENT_STORE_DIR:path.join(directory,'uploads'),CONVERSATION_STORAGE:'mongo',GEMINI_API_KEY:'',AUTH_ALLOWED_ORIGINS:origin}});
   start(process.execPath,[path.join(frontendDir,'node_modules/vite/bin/vite.js'),'--host','127.0.0.1','--port',String(frontendPort),'--strictPort'],{cwd:frontendDir,env:{...process.env,VITE_API_URL:base}});
   for(const url of [base+'/api/health',origin+'/technovalens/']){let ready=false;for(let i=0;i<200;i++){try{if((await fetch(url)).ok){ready=true;break;}}catch{}await pause(100);}assert.ok(ready,'isolated UI services started');}
@@ -54,8 +54,8 @@ try{
   await fill('password',password);await click('Login');await waitFor(`Boolean(document.querySelector('[aria-label="Sign out"]'))`);await click('My Documents');await waitFor(`document.body.textContent.includes('auth-ui.csv')`);
   await click('Settings');await waitFor(`document.querySelector('h2')?.textContent==='Account Security'`);await screenshot('account-security-desktop');
   await command('Emulation.setDeviceMetricsOverride',{width:390,height:1100,deviceScaleFactor:1,mobile:true});await screenshot('account-security-mobile');assert.equal(await evaluate('document.documentElement.scrollWidth<=window.innerWidth'),true);
-  const updatedUsername=`owner_${crypto.randomBytes(5).toString('hex')}`,updatedPassword=`Nb8!${crypto.randomBytes(20).toString('hex')}`;
-  await fill('username',updatedUsername);await fill('currentPassword',password);await fill('newPassword','weak');assert.equal(await evaluate(`document.querySelector('.auth-primary').disabled`),true);
+  const updatedUsername=`owner_${crypto.randomBytes(5).toString('hex')}`,updatedPassword=String.fromCharCode(65+crypto.randomInt(26));
+  await fill('username',updatedUsername);await fill('currentPassword',password);await fill('newPassword',updatedPassword);assert.equal(await evaluate(`document.querySelector('.auth-primary').disabled`),false);
   assert.equal(await evaluate(`/recovery/i.test(document.body.textContent)`),false,'settings has no recovery UI');
   await fill('newPassword',updatedPassword);await fill('confirmPassword',updatedPassword);await click('Save changes');await waitFor(`document.querySelector('h2')?.textContent==='Welcome Back'&&document.body.textContent.includes('Account security updated')`);
   await fill('password',password);await click('Login');await waitFor(`document.body.textContent.includes('Invalid username or password')`);

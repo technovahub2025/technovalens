@@ -17,7 +17,7 @@ try{
   reader.on('SIGINT',()=>reader.close());
   const ask=async prompt=>{process.stdout.write(prompt);const answer=await reader.question('');process.stdout.write('\n');return answer;};
   const username=(await ask('Admin username [admin] (input hidden): ')).trim()||'admin';
-  const password=await ask('Strong initial password (input hidden, 15–128 characters): ');
+  const password=await ask('Initial password (input hidden): ');
   const confirm=await ask('Confirm initial password (input hidden): ');
   if(password!==confirm)throw new Error('Passwords do not match. No account was created.');
   reader.close();reader=null;

@@ -3,10 +3,9 @@ import argon2 from 'argon2';
 
 export const hashOptions={type:argon2.argon2id,memoryCost:19456,timeCost:2,parallelism:1,hashLength:32};
 export const normalizeUsername=value=>typeof value==='string'&&/^[a-zA-Z0-9][a-zA-Z0-9_.-]{2,31}$/.test(value)?value.toLowerCase():null;
-export function passwordError(password,username=''){
-  if(typeof password!=='string'||password.length<15||password.length>128)return 'Use 15–128 characters for your password.';
-  if(!/[a-z]/.test(password)||!/[A-Z]/.test(password)||!/[0-9]/.test(password))return 'Include uppercase and lowercase letters and a number. Symbols and spaces are welcome.';
-  if(/^(?:password|letmein|qwerty|welcome|admin|technovalens)[\W\d_]*$/i.test(password)||username.length>=3&&password.toLowerCase().includes(username.toLowerCase()))return 'Choose a less predictable password that does not contain your username.';
+export function passwordError(password){
+  if(typeof password!=='string'||password.length===0)return 'Enter a password.';
+  if(password.length>128)return 'Use no more than 128 characters for your password.';
   return '';
 }
 export function recoveryCodes(id){
