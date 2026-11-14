@@ -2,6 +2,8 @@ import "./analytics.test.js";
 import "./api-optimization.test.js";
 import "./analytics-reports.test.js";
 import './pdf-report.test.js';
+import './pdf-questions.test.js';
+import './excel-report.test.js';
 import "./workspace.test.js";
 import "./workspace-api.test.js";
 import "./streaming-parser.test.js";

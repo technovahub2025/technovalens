@@ -169,7 +169,7 @@ test('Excel and paginated PDF exports contain real summaries, charts and all col
   const doc = {name:'real-data.xlsx',sheets}; const stats = analyzeDataset(sheets[0]);
   const workbook = createExcelReport(doc,sheets[0],stats,'2026-11-12T08:30:00Z');
   const restored = new ExcelJS.Workbook(); await restored.xlsx.load(await workbook.xlsx.writeBuffer());
-  assert.equal(restored.worksheets.length,5);
+  assert.equal(restored.worksheets.length,6);
   assert.equal(restored.getWorksheet('Selected Data').rowCount,5);
   assert.equal(restored.getWorksheet('Column Statistics').getRow(4).getCell(8).value,250);
   const wide = {name:'Wide',columns:Array.from({length:70},(_,i)=>`Column ${i}`),rows:[Object.fromEntries(Array.from({length:70},(_,i)=>[`Column ${i}`,i]))]};

@@ -14,6 +14,7 @@ import fs from "fs";
 import path from "path";
 import { analyzeDataset, previewDataset, answerLocally, buildCompactSheetContext, hashWorkbook, normalizeQuestion } from "./analytics.js";
 import { answerPdfLocally, localLimitation } from "./local-document.js";
+import {classifyPdfQuestion,pdfAnalysisPrompt,formatPdfAnalysis,missingInformationSuggestions,retrievePdfEvidence,pdfAnswerUsesKnownFigures} from './pdf-questions.js';
 import { connectDB, getDB } from "./config/db.js";
 import { MongoDocumentStore } from './storage/mongo-document-store.js';
 import { planSpreadsheetQuestion, answerSheetQuestion, resolveWorksheetScope } from './exact-spreadsheet.js';
@@ -148,7 +149,7 @@ let conversationStore;
 let durableDocuments;
 const CACHE_PATH = path.join(DATA_DIR, "analysis-cache.json");
 const USAGE_PATH = path.join(DATA_DIR, "gemini-usage.json");
-const PROMPT_VERSION = "2026-11-13-worksheet-scope-v4";
+const PROMPT_VERSION = "2026-11-14-grounded-pdf-v5";
 const CACHE_TTL_MS = Math.max(60_000, Number(process.env.ANALYSIS_CACHE_TTL_MS) || 24 * 60 * 60 * 1000);
 const requestedDailyBudget = Number.parseInt(process.env.GEMINI_DAILY_BUDGET, 10);
 const DAILY_GEMINI_BUDGET = Number.isInteger(requestedDailyBudget) ? Math.max(0, requestedDailyBudget) : 15;
@@ -1112,7 +1113,6 @@ async function analyzeDocument(doc, question, onProgress = () => {}, abortSignal
     doc={...doc,chatScope:scope,sheets:doc.sheets.filter(sheet=>scope.sheetNames.includes(sheet.name))};
   }
   if(doc.kind==='pdf'&&/\b(how many pages|page count|number of pages)\b/i.test(normalizedQuestion))return {answer:`This PDF has ${doc.pageCount} pages.`,source:'local-pdf',cached:false};
-  if(doc.kind==='pdf'&&/\b(sum|average|calculate|total|maximum|minimum|percentage|ratio)\b/i.test(normalizedQuestion))return {answer:'Please identify the PDF table, metric, units and verified page range to calculate. PDF text extraction does not provide a reliable rectangular dataset; upload its XLSX or CSV source for exact arithmetic. No total has been inferred from prose.',source:'local-pdf',clarification:true};
   let localFailureReason = null;
   const localAnswer = doc.kind === "pdf"
     ? answerPdfLocally(doc, normalizedQuestion, { onDiagnostic: info => { localFailureReason = info.failureReason; } })
@@ -1122,6 +1122,7 @@ async function analyzeDocument(doc, question, onProgress = () => {}, abortSignal
     onProgress("Completed", { source });
     return { answer: localAnswer, source, cached: false };
   }
+  if(doc.kind==='pdf'&&classifyPdfQuestion(normalizedQuestion).category==='calculation')return {answer:'Please identify the PDF table, metric, formula, units and verified page range to calculate. A stated total can be looked up, but new calculations require verified structured data; upload its XLSX or CSV source for exact arithmetic. No numerical result has been inferred.',source:'local-pdf',clarification:true,cached:false};
   if (doc.kind === "pdf" && (doc.extractionStatus === "ocr-required" || localFailureReason === "insufficient-extracted-text-ocr-required")) {
     const answer = localLimitation(doc, localFailureReason);
     onProgress("Completed", { source: "local-pdf", reason: localFailureReason });
@@ -1164,18 +1165,22 @@ async function performDocumentAnalysis(doc, normalizedQuestion, cacheKey, onProg
   try {
     return await performGeminiDocumentAnalysis(doc, normalizedQuestion, cacheKey, onProgress, abortSignal);
   } catch (error) {
-    if (!isDailyGeminiQuotaError(error)) throw error;
+    const pdfUnavailable=doc.kind==='pdf'&&(error.geminiNotConfigured||[401,403,429,503,504].includes(getHttpStatus(error))||error.geminiGroundingFailed);
+    if (!isDailyGeminiQuotaError(error)&&!pdfUnavailable) throw error;
     let localFailureReason = null;
     const answer = doc.kind === "pdf"
       ? answerPdfLocally(doc, normalizedQuestion, { forceSummary: true, onDiagnostic: info => { localFailureReason = info.failureReason; } })
       : answerLocally(doc.sheets, normalizedQuestion);
     const source = doc.kind === "pdf" ? "local-pdf" : "local-spreadsheet";
-    const message = answer
-      ? `${answer}\n\nGemini daily limit reached; answered using local ${doc.kind === "pdf" ? "document analysis" : "spreadsheet calculations"}.`
-      : localLimitation(doc, localFailureReason);
-    onProgress("Completed", { source, reason: "gemini-daily-limit" });
+    const suggestions=doc.kind==='pdf'&&classifyPdfQuestion(normalizedQuestion).intent==='information-gaps'?missingInformationSuggestions(doc):null;
+    const message = suggestions
+      ? `Deeper Gemini analysis is unavailable${getHttpStatus(error)?` (provider status ${getHttpStatus(error)})`:''}. The following is a local analytical checklist, not the report's stated conclusions.\n\n${suggestions}`
+      : answer
+      ? `${answer}\n\n${isDailyGeminiQuotaError(error)?'Gemini daily limit reached':'Gemini analysis is unavailable'}; answered using local ${doc.kind === "pdf" ? "document analysis" : "spreadsheet calculations"}.`
+      : `${localLimitation(doc, localFailureReason)}${pdfUnavailable?' Deeper analysis is unavailable; unrelated retrieved passages have not been substituted.':''}`;
+    onProgress("Completed", { source, reason:pdfUnavailable?'gemini-analysis-unavailable':'gemini-daily-limit' });
     const deterministicFailure = doc.kind === "pdf" && (doc.extractionStatus === "ocr-required" || /insufficient-extracted-text|requested-page-has-no-extracted-text/.test(localFailureReason || ""));
-    return { answer: message, source, cached: false, retryable: !answer && !deterministicFailure };
+    return { answer: message, source, cached: false, retryable: !answer && !deterministicFailure,analysisUnavailable:pdfUnavailable||Boolean(suggestions) };
   }
 }
 
@@ -1244,12 +1249,16 @@ async function performGeminiDocumentAnalysis(doc, normalizedQuestion, cacheKey, 
     const chunks = doc.chunks;
     if (isSummaryQuestion(normalizedQuestion)) onProgress("Generating summary");
     let selected;
-    if (doc.textLength <= SUMMARY_DIRECT_LIMIT) selected = [doc.chunks.join("\n\n").slice(0, SUMMARY_DIRECT_LIMIT)];
-    else selected = selectRelevantChunks(chunks, normalizedQuestion);
+    if (isSummaryQuestion(normalizedQuestion)) selected = [doc.chunks.join("\n\n").slice(0, SUMMARY_DIRECT_LIMIT)];
+    else selected = retrievePdfEvidence(doc,normalizedQuestion).map(item=>`${item.page?`Page ${item.page}`:'Page unverified'}\n${item.text}`);
     const context = `PDF ${doc.name}, ${doc.pageCount} pages. ${doc.textLength > SUMMARY_DIRECT_LIMIT ? "Relevant page excerpts are selected from the full extracted document." : ""}\n${selected.join("\n\n[... omitted pages ...]\n\n")}`;
-    answer = await askGemini(buildAnswerPrompt(doc, normalizedQuestion, context), doc, {
-      abortSignal, onProgress, stage: isSummaryQuestion(normalizedQuestion) ? "direct-pdf-summary" : "pdf-question", chunkNumber: 1, totalChunks: 1, modelTracker
+    const structured=!isSummaryQuestion(normalizedQuestion);
+    const grounded=structured?pdfAnalysisPrompt(doc,normalizedQuestion):null;
+    answer = await askGemini(grounded?.prompt||buildAnswerPrompt(doc, normalizedQuestion, context), doc, {
+      abortSignal, onProgress, stage: isSummaryQuestion(normalizedQuestion) ? "direct-pdf-summary" : "pdf-question", chunkNumber: 1, totalChunks: 1, modelTracker,
+      ...(structured?{responseMimeType:'application/json'}:{})
     });
+    if(structured){answer=formatPdfAnalysis(answer,grounded.evidence,{factsOnly:classifyPdfQuestion(normalizedQuestion).category==='factual'});if(!answer)throw Object.assign(new Error('PDF analysis did not pass source grounding checks.'),{geminiGroundingFailed:true});}
   } else {
     const { context: compactContext } = buildCompactSheetContext(doc.sheets, doc.chatScope?.workbookWide ? '' : normalizedQuestion);
     const sheets = doc.sheets.map(sheet => `${sheet.name}: ${sheet.rows.length} rows`).join(", ");
@@ -1262,6 +1271,7 @@ async function performGeminiDocumentAnalysis(doc, normalizedQuestion, cacheKey, 
     );
     if (structured) answer = formatStructuredSpreadsheetAnswer(answer);
   }
+  if(doc.kind==='pdf'&&!pdfAnswerUsesKnownFigures(answer,doc))throw Object.assign(new Error('PDF response contains unsupported figures or page references.'),{geminiGroundingFailed:true});
   const source = modelTracker.model === FALLBACK_GEMINI_MODEL && FALLBACK_GEMINI_MODEL
     ? "gemini-fallback" : "gemini-primary";
   analysisCache.set(cacheKey, { answer, source, expiresAt: Date.now() + CACHE_TTL_MS });

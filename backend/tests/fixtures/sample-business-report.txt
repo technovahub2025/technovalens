@@ -1,0 +1,57 @@
+Page 1
+TECHNOVALENS sample testing document Page 1
+QUARTERLY BUSINESS PERFORMANCE
+REPORT
+Sample Company Ltd. | Quarter 2, 2026 | Prepared for analysis testing
+1. Executive Summary
+Sample Company Ltd. recorded steady growth during Quarter 2 of 2026. Total revenue reached n48,50,000, compared
+with n42,00,000 in Quarter 1, representing growth of 15.5%. Net profit increased from n6,30,000 to n8,25,000. The
+strongest contribution came from the Technology Products division, while Professional Services achieved the highest
+gross margin.
+2. Quarterly Sales Performance
+Month Revenue Orders Average Order Value
+April 2026 n14,20,000 284 n5,000
+May 2026 n16,10,000 310 n5,194
+June 2026 n18,20,000 336 n5,417
+Total n48,50,000 930 n5,215
+June was the strongest month, generating n18,20,000 in revenue. Monthly revenue increased consistently from April to
+June. Average order value also improved each month, suggesting customers purchased higher-value combinations of
+products and services.
+3. Revenue by Business Division
+Division Q2 Revenue Share of Revenue Gross Margin
+Technology Products n22,50,000 46.4% 32%
+Professional Services n15,00,000 30.9% 48%
+Accessories n11,00,000 22.7% 25%
+Total n48,50,000 100% —
+Technology Products generated the largest share of revenue at 46.4%. Professional Services had the highest gross
+margin at 48%, indicating strong profitability despite contributing a smaller share of total sales.
+
+Page 2
+TECHNOVALENS sample testing document Page 2
+QUARTERLY BUSINESS PERFORMANCE
+REPORT
+Sample Company Ltd. | Quarter 2, 2026 | Continued
+4. Expense and Profit Summary
+Financial Metric Quarter 1 2026 Quarter 2 2026
+Revenue n42,00,000 n48,50,000
+Operating Expenses n29,70,000 n33,25,000
+Gross Profit n12,30,000 n15,25,000
+Net Profit n6,30,000 n8,25,000
+Net Profit Margin 15.0% 17.0%
+5. Key Findings
+• Revenue growth: Q2 revenue increased by n6,50,000, or approximately 15.5%, compared with Q1.
+• Profit improvement: Net profit rose by n1,95,000, an increase of approximately 31.0%.
+• Margin improvement: Net profit margin improved from 15.0% to 17.0%, a gain of 2 percentage points.
+• Best-performing month: June recorded the highest monthly revenue at n18,20,000.
+• Division performance: Technology Products led revenue, while Professional Services led gross margin.
+6. Recommendations
+• Increase marketing investment in Technology Products, which contributes the largest share of revenue.
+• Review Professional Services delivery capacity and explore expansion of this high-margin division.
+• Study the factors behind June's sales performance and repeat successful campaigns next quarter.
+• Monitor operating expenses monthly to ensure revenue growth continues to translate into profit growth.
+7. Conclusion
+Sample Company Ltd. delivered a positive Quarter 2 result, with higher revenue, stronger net profit, and an improved net
+profit margin. The business should focus on scaling its leading revenue division while expanding its high-margin services.
+Continued monitoring of monthly sales and operating expenses will help sustain profitable growth.
+Note: This is fictional sample data created for testing document upload, PDF extraction, summarization, question answering, and
+numerical understanding in TECHNOVALENS.

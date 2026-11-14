@@ -1,6 +1,8 @@
+import {classifyPdfQuestion,answerVerifiedPdfQuestion} from './pdf-questions.js';
+
 const STOP_WORDS = new Set((
   "a about above after again against all am an and any are as at be because been before being below between both but by can could did do does doing down during each few for from further had has have having he her here hers herself him himself his how i if in into is it its itself just me more most my myself no nor not of off on once only or other our ours ourselves out over own same she should so some such than that the their theirs them themselves then there these they this those through to too under until up very was we were what when where which while who whom why will with would you your yours " +
-  "document documents file files pdf report reports page pages important main key major discuss discussed topics topic subjects subject points point overall overview summary summarize summarise explained explain tell give question answers answer shows showed according mention says stated found finding findings"
+  "document documents file files pdf report reports page pages important main key major discuss discussed topics topic subjects subject points point overall overview summary summarize summarise explained explain tell give question answers answer shows showed according mention say saying says stated found finding findings facts describe describes information contains include includes"
 ).split(/\s+/));
 
 const TOPIC_QUESTION = /\b(topic|topics|subject|subjects|discuss(?:ed|es|ing)?|major finding|major findings|what.{0,30}document.{0,20}(?:about|discuss)|what.{0,30}pdf.{0,20}(?:about|discuss))\b/i;
@@ -175,6 +177,12 @@ export function answerPdfLocally(doc, question, { forceSummary = false, onDiagno
   if (info.potentiallyScanned || !info.nonEmptyPages || info.retrievedTextLength < 20) {
     return finish(null, "insufficient-extracted-text-ocr-required");
   }
+  const classification=classifyPdfQuestion(q);
+  const verified=answerVerifiedPdfQuestion(doc,q);
+  if(verified)return finish(verified);
+  if(classification.complex)return finish(null,'question-requires-grounded-reasoning');
+  if(classification.category==='calculation')return finish(null,'exact-calculation-needs-verified-table');
+  if(classification.intent==='stated-recommendations')return finish(null,'no-explicit-recommendations-section');
   if (!sentences.length) return finish(null, "no-extractable-sentences");
   const selectedPages = pageNumber ? pages.filter(page => page.number === pageNumber) : pages;
   if (pageNumber && !selectedPages.some(page => page.text.trim())) {
@@ -251,7 +259,7 @@ export function answerPdfLocally(doc, question, { forceSummary = false, onDiagno
   }
 
   const matches = ranked.filter(item => queryTerms.length
-    ? queryTerms.filter(term => item.text.toLocaleLowerCase().includes(term)).length > 0
+    ? new Set(queryTerms.filter(term => item.text.toLocaleLowerCase().includes(term))).size >= Math.max(1,Math.ceil(new Set(queryTerms).size*.7))
     : false).sort((a, b) => b.score - a.score || a.index - b.index);
   const selected = uniqueSentences(matches, 4);
   if (!selected.length) return finish(null, pageNumber ? "no-relevant-text-on-requested-page" : "no-relevant-sentence-match");

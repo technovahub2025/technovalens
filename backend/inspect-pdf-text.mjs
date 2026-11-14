@@ -1,0 +1,4 @@
+import fs from 'node:fs/promises';
+import {PDFParse} from 'pdf-parse';
+const parser=new PDFParse({data:await fs.readFile(process.argv[2])});
+try{const result=await parser.getText({pageJoiner:''});for(const page of result.pages)console.log(`Page ${page.num}\n${JSON.stringify(page.text)}`);if(process.argv.includes('--fixture'))await fs.writeFile(new URL('./tests/fixtures/sample-business-report.txt',import.meta.url),result.pages.map(page=>`Page ${page.num}\n${page.text}`).join('\n\n'));await fs.mkdir(new URL('./.data/pdf-chat-validation/',import.meta.url),{recursive:true});for(const page of (await parser.getScreenshot({scale:1,imageDataUrl:false})).pages)await fs.writeFile(new URL(`./.data/pdf-chat-validation/source-page-${page.pageNumber}.png`,import.meta.url),page.data);}finally{await parser.destroy();}

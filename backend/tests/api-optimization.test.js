@@ -29,6 +29,7 @@ const providerServer = createServer(async (req, res) => {
   try { requestBody = JSON.parse(Buffer.concat(requestParts).toString("utf8")); mock.lastPrompt = requestBody.contents?.[0]?.parts?.[0]?.text || ""; }
   catch { mock.lastPrompt = ""; }
   mock.lastMime = requestBody?.generationConfig?.responseMimeType || null;
+  if(mock.mode==='401'){res.writeHead(401,{'content-type':'application/json'}).end(JSON.stringify({error:{code:401,status:'UNAUTHENTICATED',message:'Test authentication error.'}}));mock.active--;return;}
   if (mock.delayMs) await new Promise(resolve => setTimeout(resolve, mock.delayMs));
   const finish = () => { mock.active--; };
   if (mock.mode === "503" || mock.mode === "503-primary" && mock.lastModel === "gemini-flash-latest") {
@@ -56,7 +57,9 @@ const providerServer = createServer(async (req, res) => {
     res.writeHead(400, { "content-type": "application/json" }).end(JSON.stringify({ error: { code: 400, status: "INVALID_ARGUMENT", message: "Invalid mock request." } })); finish();
     return;
   }
-  const generatedText = mock.lastMime === "application/json"
+  const generatedText = mock.lastPrompt.includes('PDF_GROUNDED_ANALYSIS')
+    ? JSON.stringify({sourceFacts:[],analysis:['Assess capacity and operating costs alongside the reported business performance.'],analyticalSuggestions:['Consider measuring customer retention, product profitability, marketing ROI, regional sales, cash flow and future forecasts.']})
+    : mock.lastMime === "application/json"
     ? JSON.stringify({ summary: "Regional revenues differ.", keyInsights: ["North leads."], trends: [], anomalies: [], recommendations: ["Review the regional mix."] })
     : "The regional data shows two distinct revenue levels.";
   res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({
@@ -247,7 +250,7 @@ test("Excel API caching, single-flight, 429/503 retries, local answers and persi
     const pdfSummary = await (await ask(running.base, pdf.fileId, "Assess the competitive threats to this company over the next five years.")).json();
     assert.equal(pdfSummary.source, "gemini-primary");
     assert.equal(mock.lastApiKey, "test-only-key", "Gemini receives the trimmed API key");
-    assert.match(pdfSummary.answer, /regional data/);
+    assert.match(pdfSummary.answer, /Analysis \(inferences, not statements from the report\)/);
     let expectedProviderCalls = 1;
     const costRows = [["Type", "Revenue"], ...Array.from({ length: 100 }, (_, index) => [`ArchiveOnlyRecord${index}`, index])];
     const first = await uploadWorkbook(running.base, [["North", 125], ["South", 90]], [["Costs", costRows]], "https://www.technovahub.in");
@@ -647,6 +650,30 @@ test("local spreadsheet analytics remain available without a Gemini key", { time
   }
 });
 
+test('actual sample PDF lookup, missing-information analysis, provider failures and private history remain grounded',{timeout:90000},async()=>{
+  await new Promise(resolve=>providerServer.listen(0,'127.0.0.1',resolve));
+  const dataDir=await mkdtemp(path.join(os.tmpdir(),'technovalens-pdf-grounding-'));let running;
+  try{
+    mock.mode='success';running=await startBackend({dataDir,budget:100});
+    const form=new FormData();form.append('file',new Blob([await readFile(new URL('./fixtures/sample-business-report.pdf',import.meta.url))],{type:'application/pdf'}),'sample-business-report.pdf');
+    const response=await fetch(`${running.base}/api/files/upload`,{method:'POST',body:form});assert.equal(response.status,200);const pdf=await response.json();
+    const before=mock.calls;
+    for(const [question,expected] of [['How many total orders were recorded during Q2?',/930.*Page 1/],['Which business division had the highest gross margin?',/Professional Services: 48%.*Page 1/],['What recommendations does the report provide?',/Increase marketing investment.*Page 2/],['Compare Q1 and Q2 net profit',/6,30,000 versus Q2: n?8,25,000.*Page 2/]]){
+      const answer=await (await ask(running.base,pdf.fileId,question)).json();assert.equal(answer.source,'local-pdf');assert.match(answer.answer,expected);
+    }
+    assert.equal(mock.calls,before,'verified table and recommendations lookups make no provider requests');
+    const question='What information is missing from this report?';
+    const analysis=await (await ask(running.base,pdf.fileId,question)).json();assert.equal(analysis.source,'gemini-primary');assert.match(analysis.answer,/Analytical suggestions \(not facts stated/);assert.match(analysis.answer,/retention.*profitability.*marketing ROI.*regional sales.*cash flow.*forecasts/);
+    assert.match(mock.lastPrompt,/PDF_GROUNDED_ANALYSIS/);assert.match(mock.lastPrompt,/Page 1/);assert.doesNotMatch(analysis.answer,/delivered a positive Quarter/);
+    for(const [index,mode] of ['401','429daily','503'].entries()){
+      mock.mode=mode;const unavailable=await (await ask(running.base,pdf.fileId,`${question} Focus request ${index}.`)).json();assert.equal(unavailable.source,'local-pdf');assert.equal(unavailable.analysisUnavailable,true);assert.match(unavailable.answer,/Deeper Gemini analysis is unavailable/);assert.match(unavailable.answer,/Analytical suggestions/);assert.doesNotMatch(unavailable.answer,/delivered a positive Quarter/);
+      const verified=await (await ask(running.base,pdf.fileId,'How many total orders were recorded during Q2?')).json();assert.match(verified.answer,/930.*Page 1/);
+    }
+    const denied=await fetch(`${running.base}/api/ai/ask`,{method:'POST',headers:{'content-type':'application/json','X-Workspace-Token':'2'.repeat(64)},body:JSON.stringify({fileId:pdf.fileId,question})});assert.equal(denied.status,404);
+    mock.mode='success';const retry=await (await ask(running.base,pdf.fileId,`${question} Focus request 0.`)).json();assert.equal(retry.source,'gemini-primary','unavailable answers were not cached');
+  }finally{if(running)await stopBackend(running.child);await new Promise(resolve=>providerServer.close(resolve));await rm(dataDir,{recursive:true,force:true});}
+});
+
 test("PDF primary/fallback generation, quota routing, chunking, recovery and Excel answers", { timeout: 120000 }, async () => {
   providerServer.listen(0, "127.0.0.1");
   await once(providerServer, "listening");
@@ -711,8 +738,8 @@ test("PDF primary/fallback generation, quota routing, chunking, recovery and Exc
     const failedQuestion = "Assess the report's long term strategic implications after both providers are unavailable.";
     const beforeBothFail = mock.calls;
     const bothUnavailable = await ask(running.base, pdf.fileId, failedQuestion);
-    assert.equal(bothUnavailable.status, 503);
-    assert.match((await bothUnavailable.json()).error, /temporarily unavailable/i);
+    assert.equal(bothUnavailable.status, 200);
+    assert.match((await bothUnavailable.json()).answer, /Deeper analysis is unavailable/i);
     assert.equal(mock.calls - beforeBothFail, 6, "primary and fallback each get no more than two retries");
 
     mock.mode = "success";
