@@ -17,7 +17,7 @@ export async function loadConversation(api, id, {signal} = {}) {
 export function initialPage(location) {
   const route=(location.hash||location.pathname||'').toLowerCase().replace(/^#\/?/,'').replace(/\/$/,'');
   if(/(?:^|\/)(analytics|reports)$/.test(route))return 'Reports';
-  if(/(?:^|\/)(files|excel-files)$/.test(route))return 'Excel Files';
-  if(/(?:^|\/)(chat|ai-excel-chat)$/.test(route))return 'AI Excel Chat';
+  if(/(?:^|\/)(files|excel-files)$/.test(route))return 'My Documents';
+  if(/(?:^|\/)(chat|ai-excel-chat)$/.test(route))return 'AI Assistant';
   return 'Dashboard';
 }

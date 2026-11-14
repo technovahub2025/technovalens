@@ -126,8 +126,8 @@ function safeText(value, fallback = "") {
 
 const nav = [
   ["Dashboard", LayoutDashboard],
-  ["Excel Files", Files],
-  ["AI Excel Chat", MessageSquareText],
+  ["My Documents", Files],
+  ["AI Assistant", MessageSquareText],
   ["Reports", Activity]
 ];
 
@@ -138,7 +138,7 @@ const nav = [
 export default function App() {
   const [active, setActive] = useState(()=>initialPage(window.location));
   useEffect(()=>{
-    const routes={'Dashboard':'dashboard','Excel Files':'files','AI Excel Chat':'chat','Reports':'reports'};
+    const routes={'Dashboard':'dashboard','My Documents':'files','AI Assistant':'chat','Reports':'reports'};
     if(routes[active])window.history.replaceState(null,'',`${window.location.pathname}${window.location.search}#${routes[active]}`);
   },[active]);
   useEffect(()=>{const navigate=()=>{
@@ -236,7 +236,7 @@ export default function App() {
     setCurrentConversationId(null);setFileInfo(null);setPreview([]);setMessages([]);setFile(null);setQuestion('');
     setLoadingConversation(true);
     setNotice("");
-    setActive(options.active || 'AI Excel Chat');
+    setActive(options.active || 'AI Assistant');
 
     try {
       const {chat,document,recoveryMessage}=await loadConversation(api,conversation.id);
@@ -258,7 +258,7 @@ export default function App() {
 
       setMessages(restoredMessages);
 
-      setActive(options.active || "AI Excel Chat");
+      setActive(options.active || "AI Assistant");
 
       try {
         localStorage.setItem(
@@ -304,7 +304,7 @@ export default function App() {
       }
 
       await restoreConversation(chat, {
-        active: "Excel Files"
+        active: "My Documents"
       });
 
     } catch (error) {
@@ -476,7 +476,7 @@ export default function App() {
 
       await refreshPersistentLists();
 
-      setActive("Excel Files");
+      setActive("My Documents");
 
       setNotice(
         [
@@ -590,7 +590,7 @@ export default function App() {
     setQuestion("");
     setBusy(true);
     setProcessStage("Analysing document");
-    setActive("AI Excel Chat");
+    setActive("AI Assistant");
 
     try {
       if (!currentConversationId) {
@@ -979,7 +979,7 @@ export default function App() {
               <Icon size={18} />
               <span>{label}</span>
 
-              {label === "AI Excel Chat" && (
+              {label === "AI Assistant" && (
                 <i className="new-dot" />
               )}
             </button>
@@ -1081,8 +1081,11 @@ export default function App() {
               </h1>
 
               <p className="subheading">
-                Turn your spreadsheets into clear answers
-                and actionable insights.
+                {active === "My Documents"
+                  ? "Upload, organize and explore your documents."
+                  : active === "AI Assistant"
+                    ? "Ask questions about your spreadsheets and PDFs."
+                    : "Turn your spreadsheets into clear answers and actionable insights."}
               </p>
             </div>
 
@@ -1157,7 +1160,7 @@ export default function App() {
           {/* AI CHAT */}
           {/* ================================================= */}
 
-          {active === "AI Excel Chat" ? (
+          {active === "AI Assistant" ? (
 
             <section className="chat-layout">
 
@@ -1173,7 +1176,7 @@ export default function App() {
                     <div>
                       <h3>Ask your document</h3>
                       <p>
-                        Answers grounded in your uploaded file
+                        Ask questions about your spreadsheets and PDFs.
                       </p>
                     </div>
                   </div>
@@ -1324,7 +1327,7 @@ export default function App() {
 
             </section>
 
-          ) : active === "Excel Files" ? (
+          ) : active === "My Documents" ? (
 
             /* ================================================= */
             /* FILES PAGE */
@@ -1337,7 +1340,7 @@ export default function App() {
                 <div>
                   <h3>Your files</h3>
                   <p>
-                    Upload and preview PDF or spreadsheet content.
+                    Upload, organize and explore your documents.
                   </p>
                 </div>
 
@@ -1722,7 +1725,7 @@ export default function App() {
 
                   </div>
 
-                  <button onClick={() => setActive("Excel Files")}>
+                  <button onClick={() => setActive("My Documents")}>
 
                     <div className="quick-icon">
                       <CloudUpload />
@@ -1737,7 +1740,7 @@ export default function App() {
 
                   </button>
 
-                  <button onClick={() => setActive("AI Excel Chat")}>
+                  <button onClick={() => setActive("AI Assistant")}>
 
                     <div className="quick-icon">
                       <Bot />
@@ -1786,7 +1789,7 @@ export default function App() {
 
                   <button
                     className="text-button"
-                    onClick={() => setActive("Excel Files")}
+                    onClick={() => setActive("My Documents")}
                   >
                     View all
                   </button>

@@ -15,7 +15,7 @@ export default function AnalyticsReports({ page, files, selectedId, onSelect }) 
   const workbooks = files.filter(f => f.kind === "spreadsheet");
   const workbook = workbooks.find(f => f.fileId === selectedId) || workbooks[0];
   useEffect(() => { if (workbook && workbook.fileId !== selectedId) onSelect(workbook.fileId); }, [workbook?.fileId, selectedId]);
-  if (!workbook) return <div className="insights-page"><div className="insights-heading"><h1>{page}</h1></div><div className="insight-empty"><div><FileSpreadsheet size={32}/></div><h2>Your data, brought to life</h2><p>Upload an XLSX workbook or CSV file from Excel Files to explore real metrics, interactive charts, and downloadable reports.</p></div></div>;
+  if (!workbook) return <div className="insights-page"><div className="insights-heading"><h1>{page}</h1></div><div className="insight-empty"><div><FileSpreadsheet size={32}/></div><h2>Your data, brought to life</h2><p>Upload an XLSX workbook or CSV file from My Documents to explore real metrics, interactive charts, and downloadable reports.</p></div></div>;
   return <WorkbookView key={workbook.fileId} {...{ page, workbook, workbooks, onSelect }}/>;
 }
 
