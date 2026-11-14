@@ -14,6 +14,7 @@ import {
 import AnalyticsReports from "./AnalyticsReports.jsx";
 import { loadConversation, initialPage } from './conversation-client.js';
 import { validateFileMetadata, validateUpload, fileDimensions } from "./api-contracts.js";
+import {useDashboard,useLocalGreeting} from './useDashboard.jsx';
 
 // =====================================================
 // API CONFIGURATION
@@ -168,6 +169,10 @@ export default function App({authUser,onLogout,onManageRecovery}) {
   ]);
 
   const [documents, setDocuments] = useState([]);
+  const [activityDays,setActivityDays]=useState(7);
+  const [dashboardRevision,setDashboardRevision]=useState(0);
+  const dashboard=useDashboard(activityDays,dashboardRevision,active==='Dashboard');
+  const greeting=useLocalGreeting();
   const [selectedWorkbookId, setSelectedWorkbookId] = useState(() => {
     try { return localStorage.getItem(storageKey('selectedWorkbookId')) || ""; } catch { return ""; }
   });
@@ -219,6 +224,7 @@ export default function App({authUser,onLogout,onManageRecovery}) {
     files.forEach(validateFileMetadata);
     setDocuments(files);
     setConversations(chats);
+    setDashboardRevision(value=>value+1);
 
     return { files, chats };
   }
@@ -577,6 +583,7 @@ export default function App({authUser,onLogout,onManageRecovery}) {
     if(requestFileId!==fileInfo?.fileId||!currentConversationId){setNotice('Reopen the original conversation before retrying this question.');return;}
     const requestConversationId=currentConversationId,requestSequence=openSequenceRef.current;
     const requestSelectedSheet=retryRequest?(retryRequest.selectedSheet??null):selectedSheet;
+    let requestQuestionId=retryRequest?(retryRequest.questionId||undefined):crypto.randomUUID();
     const controller=new AbortController();chatControllerRef.current=controller;
     const stillSelected=()=>openSequenceRef.current===requestSequence&&!controller.signal.aborted;
 
@@ -601,14 +608,16 @@ export default function App({authUser,onLogout,onManageRecovery}) {
         );
       }
 
-      if (!retryRequest) {
-        await api.post(
+      if (!retryRequest||requestQuestionId) {
+        const savedQuestion=await api.post(
           `/conversations/${requestConversationId}/messages`,
           {
             role: "user",
-            text: q,fileId:requestFileId
+            text: q,fileId:requestFileId,clientRequestId:requestQuestionId
           },{signal:controller.signal}
         );
+        requestQuestionId=savedQuestion.data.id;
+        setDashboardRevision(value=>value+1);
       }
 
       let answer = "";
@@ -634,6 +643,7 @@ export default function App({authUser,onLogout,onManageRecovery}) {
             body: JSON.stringify({
               fileId: requestFileId,
               conversationId:requestConversationId,
+              questionId:requestQuestionId,
               selectedSheet:requestSelectedSheet,
               question: q
             })
@@ -767,6 +777,7 @@ export default function App({authUser,onLogout,onManageRecovery}) {
             {
               fileId: requestFileId,
               conversationId:requestConversationId,
+              questionId:requestQuestionId,
               selectedSheet:requestSelectedSheet,
               question: q
             },{signal:controller.signal}
@@ -815,6 +826,7 @@ export default function App({authUser,onLogout,onManageRecovery}) {
                 fileId: requestFileId,
                 selectedSheet:requestSelectedSheet,
                 question: q,
+                questionId:requestQuestionId,
                 retryCount:
                   (retryRequest?.retryCount || 0) +
                   (retryRequest ? 1 : 0)
@@ -855,6 +867,7 @@ export default function App({authUser,onLogout,onManageRecovery}) {
           fileId: requestFileId,
           selectedSheet:requestSelectedSheet,
           question: q,
+          questionId:requestQuestionId,
           retryCount: retryRequest
             ? (retryRequest.retryCount || 0) + 1
             : 0
@@ -886,46 +899,31 @@ export default function App({authUser,onLogout,onManageRecovery}) {
   const stats = [
     {
       label: "Uploaded files",
-      value: documents.length,
+      value: dashboard.data?.uploadedFiles??'—',
       icon: Files,
       change: "PDFs and spreadsheets"
     },
     {
       label: "Total records",
-      value:
-        fileInfo?.totalRowCount ?? fileInfo?.rowCount ??
-        (fileInfo?.pageCount
-          ? `${fileInfo.pageCount} pages`
-          : "—"),
+      value:dashboard.data?.totalRecords??'—',
       icon: Users,
-      change:
-        fileInfo?.kind === "pdf"
-          ? "Pages detected"
-          : "Rows detected"
+      change:"Rows across all worksheets"
     },
     {
       label: "Data columns",
-      value: fileInfo?.columnCount ?? "—",
+      value: dashboard.data?.dataColumns??'—',
       icon: BarChart3,
-      change: "Fields detected"
+      change: "Sum across all worksheets"
     },
     {
       label: "AI questions",
-      value: messages.filter(x => x.role === "user").length,
+      value: dashboard.data?.aiQuestions??'—',
       icon: Bot,
-      change: "This session"
+      change: "Submitted across your workspace"
     }
   ];
 
-  const chartData = [
-    { name: "Mon", value: 18 },
-    { name: "Tue", value: 29 },
-    { name: "Wed", value: 23 },
-    { name: "Thu", value: 38 },
-    { name: "Fri", value: 31 },
-    { name: "Sat", value: 47 },
-    { name: "Sun", value: 40 }
-  ];
+  const chartData = dashboard.data?.activity||[];
 
   // =====================================================
   // SOURCE LABELS
@@ -1078,7 +1076,7 @@ export default function App({authUser,onLogout,onManageRecovery}) {
 
               <h1>
                 {active === "Dashboard"
-                  ? "Good morning!"
+                  ? greeting
                   : active}
               </h1>
 
@@ -1597,6 +1595,9 @@ export default function App({authUser,onLogout,onManageRecovery}) {
 
             <>
 
+              {dashboard.status==='loading'&&<p role="status">Loading dashboard…</p>}
+              {dashboard.status==='error'&&<div className="notice" role="alert">{dashboard.error}<button className="text-button" onClick={dashboard.retry}>Retry dashboard</button></div>}
+
               <div className="stats-grid">
 
                 {stats.map(({ label, value, icon: Icon, change }) => (
@@ -1634,16 +1635,15 @@ export default function App({authUser,onLogout,onManageRecovery}) {
                       </p>
                     </div>
 
-                    <button className="period-button">
-                      Last 7 days
-                      <ChevronDown size={15} />
-                    </button>
+                    <select className="period-button" aria-label="Activity date range" value={activityDays} onChange={event=>setActivityDays(Number(event.target.value))}>
+                      {[7,30,90].map(days=><option key={days} value={days}>Last {days} days</option>)}
+                    </select>
 
                   </div>
 
                   <div className="chart-area">
 
-                    <ResponsiveContainer
+                    {dashboard.status!=='success'?<div className="empty-state" role="status">{dashboard.status==='loading'?'Loading activity…':'Activity unavailable'}</div>:!dashboard.data.hasActivity?<div className="empty-state">No activity yet</div>:<ResponsiveContainer
                       width="100%"
                       height="100%"
                     >
@@ -1688,6 +1688,7 @@ export default function App({authUser,onLogout,onManageRecovery}) {
                         />
 
                         <YAxis
+                          allowDecimals={false}
                           axisLine={false}
                           tickLine={false}
                           tick={{
@@ -1696,7 +1697,7 @@ export default function App({authUser,onLogout,onManageRecovery}) {
                           }}
                         />
 
-                        <Tooltip />
+                        <Tooltip labelFormatter={(_label,payload)=>payload?.[0]?.payload?.date||''} formatter={value=>[value,'Uploads + AI questions']}/>
 
                         <Area
                           type="monotone"
@@ -1708,7 +1709,7 @@ export default function App({authUser,onLogout,onManageRecovery}) {
 
                       </AreaChart>
 
-                    </ResponsiveContainer>
+                    </ResponsiveContainer>}
 
                   </div>
 
@@ -1783,7 +1784,7 @@ export default function App({authUser,onLogout,onManageRecovery}) {
                 <div className="section-title">
 
                   <div>
-                    <h3>Recent file</h3>
+                    <h3>Recent files</h3>
                     <p>
                       Your latest uploaded document or spreadsheet
                     </p>
@@ -1798,22 +1799,22 @@ export default function App({authUser,onLogout,onManageRecovery}) {
 
                 </div>
 
-                {fileInfo ? (
+                {dashboard.status!=='success'?<div className="empty-state">{dashboard.status==='loading'?'Loading recent files…':'Recent files unavailable'}</div>:dashboard.data.recentFiles.length ? dashboard.data.recentFiles.map(recentFile=>(
 
-                  <div className="file-row">
+                  <div className="file-row" key={recentFile.fileId}>
 
                     <div className="file-symbol">
-                      {fileInfo.kind === "pdf"
+                      {recentFile.kind === "pdf"
                         ? <FileText />
                         : <FileSpreadsheet />}
                     </div>
 
                     <div className="file-meta">
 
-                      <b>{safeText(fileInfo.fileName)}</b>
+                      <b>{safeText(recentFile.fileName)}</b>
 
                       <small>
-                        {fileDimensions(fileInfo)}
+                        {fileDimensions(recentFile)}
                       </small>
 
                     </div>
@@ -1824,7 +1825,7 @@ export default function App({authUser,onLogout,onManageRecovery}) {
 
                   </div>
 
-                ) : (
+                )) : (
 
                   <div className="empty-state">
 

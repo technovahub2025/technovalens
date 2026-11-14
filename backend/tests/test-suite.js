@@ -1,6 +1,7 @@
 import "./analytics.test.js";
 import './auth.test.js';
 import './auth-client.test.js';
+import './dashboard.test.js';
 import "./api-optimization.test.js";
 import "./analytics-reports.test.js";
 import './pdf-report.test.js';

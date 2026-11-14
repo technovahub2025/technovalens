@@ -3,6 +3,7 @@ import {Sparkles,LogOut} from 'lucide-react';
 import App from './App.jsx';
 import {api,setCsrfToken} from './api.js';
 import './auth.css';
+import PasswordInput from './PasswordInput.jsx';
 
 let bootstrap;
 function loadSession(){
@@ -54,8 +55,14 @@ export default function AuthApp(){
       setForm({...emptyForm,username:account.username});setMode('login');await refresh();setNotice('Account security updated. All previous sessions have ended. Log in again.');
     }catch(error){setError(message(error));}finally{setBusy(false);}
   }
-  const field=(name,label,type='text',autoComplete)=> <label className="auth-field" key={name}>{label}<input name={name} type={type} value={form[name]} autoComplete={autoComplete} autoCapitalize="none" spellCheck={false} required maxLength={name==='username'?32:128} minLength={name==='username'?3:undefined} onChange={event=>setForm({...form,[name]:event.target.value})}/></label>;
-  const accountField=(name,label,type='password',autoComplete='new-password',required=false)=> <label className="auth-field" key={name}>{label}<input name={name} type={type} value={account[name]} autoComplete={autoComplete} required={required} maxLength={name==='username'?32:128} minLength={name==='username'?3:undefined} onChange={event=>setAccount({...account,[name]:event.target.value})}/></label>;
+  const field=(name,label,type='text',autoComplete)=>{
+    const id=`auth-${mode}-${name}`,props={id,name,value:form[name],autoComplete,autoCapitalize:'none',spellCheck:false,required:true,maxLength:name==='username'?32:128,minLength:name==='username'?3:undefined,onChange:event=>setForm({...form,[name]:event.target.value})};
+    return <div className="auth-field" key={`${mode}-${name}`}><label htmlFor={id}>{label}</label>{type==='password'?<PasswordInput {...props} label={label}/>:<input {...props} type={type}/>}</div>;
+  };
+  const accountField=(name,label,type='password',autoComplete='new-password',required=false)=>{
+    const id=`auth-account-${name}`,props={id,name,value:account[name],autoComplete,required,maxLength:name==='username'?32:128,minLength:name==='username'?3:undefined,onChange:event=>setAccount({...account,[name]:event.target.value})};
+    return <div className="auth-field" key={name}><label htmlFor={id}>{label}</label>{type==='password'?<PasswordInput {...props} label={label}/>:<input {...props} type={type}/>}</div>;
+  };
   if(user&&!manage)return <>{error&&<div className="auth-session-notice" role="alert">{error}</div>}<App key={user.id} authUser={user} onLogout={logout} onManageRecovery={()=>{setError('');setAccount({...emptyAccount,username:user.username});setManage(true);}}/></>;
   return <main className="auth-page">
     <section className="auth-form-side" aria-label={manage?'Account Security':mode==='signup'?'Sign Up':'Login'}><div className="auth-card">

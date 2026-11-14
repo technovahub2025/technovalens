@@ -10,6 +10,7 @@
 .auth-field{display:flex;flex-direction:column;gap:8px;font-size:13px;font-weight:600;color:#493f59;margin:20px 0}
 .auth-field input{width:100%;min-height:46px;padding:12px 14px;border:1px solid #ded7e9;border-radius:9px;font:inherit;font-size:14px;background:#fff;color:#29243a;box-sizing:border-box}
 .auth-field input:focus{outline:2px solid #bba0e9;outline-offset:2px;border-color:#8052d6}
+.auth-password-input{position:relative}.auth-password-input input{padding-right:48px}.auth-password-toggle{position:absolute;right:4px;top:50%;transform:translateY(-50%);width:40px;height:40px;display:grid;place-items:center;border:0;background:transparent;color:#81768f;cursor:pointer;border-radius:6px}.auth-password-toggle:hover{color:#8052d6}.auth-password-toggle:focus-visible{outline:2px solid #bba0e9;outline-offset:1px}
 .auth-primary{display:flex;align-items:center;justify-content:center;width:100%;padding:13px 16px;min-height:46px;box-sizing:border-box;border:1px solid #8052d6;border-radius:9px;background:#8052d6;color:#fff;cursor:pointer;font:inherit;font-size:14px;font-weight:600;margin-top:26px;transition:background .15s}
 .auth-primary:hover{background:#7043c3}
 .auth-primary:disabled{opacity:.55;cursor:not-allowed}

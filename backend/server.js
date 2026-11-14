@@ -22,6 +22,8 @@ import { JsonConversationStore } from "./storage/json-conversation-store.js";
 import { LocalDocumentCache } from './storage/local-document-cache.js';
 import {createAuthentication} from './auth.js';
 import {authenticationProxyHops,authenticationOrigins} from './auth-config.js';
+import {WorkspaceActivityStore,dashboardSummary} from './dashboard.js';
+import {isRequestId} from './conversation-message.js';
 
 // Resolve the backend .env from this file, regardless of the directory used to start Node.
 const envPath = fileURLToPath(new URL("./.env", import.meta.url));
@@ -50,6 +52,7 @@ const proxyHops=authenticationProxyHops();
 app.set('trust proxy',proxyHops);
 let localCache;
 let authentication;
+let workspaceActivity;
 const storageReadOnly=process.env.STORAGE_READ_ONLY==='true';
 
 const allowedOrigins = authenticationOrigins();
@@ -606,6 +609,8 @@ async function receiveFile(req, res) {
     }
     response.fileName = record.name;
     response.conversationId = conversation.id;
+    if(!storageReadOnly)await workspaceActivity.record(req.ownerHash,`upload:${fileId}`,'upload',record.uploadedAt);
+    ensureConnected();
     console.info("Uploaded document stored:", { backendInstanceId, fileId, mapSize: documents.size, kind: record.kind });
     delete response.ownerHash;
     committed=true;
@@ -637,7 +642,7 @@ async function receiveFile(req, res) {
       const cleanupStarted=performance.now();
       try{
         const cleanup=[];
-        if(createdId){documents.delete(createdId);clearSheetCache(createdId);if(sheetDirectory)cleanup.push(()=>fs.rmSync(sheetDirectory,{recursive:true,force:true}));cleanup.push(()=>fs.rmSync(path.join(documentStorePath,`${createdId}.json`),{force:true}),()=>conversationStore.deleteForFile(createdId,req.ownerHash));if(durableDocuments)cleanup.push(()=>durableDocuments.delete(createdId,req.ownerHash));}
+        if(createdId){documents.delete(createdId);clearSheetCache(createdId);if(sheetDirectory)cleanup.push(()=>fs.rmSync(sheetDirectory,{recursive:true,force:true}));cleanup.push(()=>fs.rmSync(path.join(documentStorePath,`${createdId}.json`),{force:true}),()=>conversationStore.deleteForFile(createdId,req.ownerHash),()=>workspaceActivity.remove(req.ownerHash,`upload:${createdId}`));if(durableDocuments)cleanup.push(()=>durableDocuments.delete(createdId,req.ownerHash));}
         if(metadataTemporaryPath)cleanup.push(()=>fs.rmSync(metadataTemporaryPath,{force:true}));
         const outcomes=await Promise.allSettled(cleanup.map(action=>Promise.resolve().then(action)));
         const failed=outcomes.find(outcome=>outcome.status==='rejected');if(failed)throw failed.reason;
@@ -659,6 +664,13 @@ function admitUpload(_req,res,next){
 app.post("/api/files/upload", admitUpload,upload.single("file"), receiveFile);
 // Keep the original Excel upload URL working for existing clients; it now accepts CSV too.
 app.post("/api/excel/upload", admitUpload,upload.single("file"), receiveFile);
+app.get('/api/dashboard',async(req,res)=>{
+  try{
+    const files=[...documents.values()].filter(owns).map(listDocumentMetadata);
+    const [events,history]=await Promise.all([workspaceActivity.list(req.ownerHash),conversationStore.activity(req.ownerHash)]);
+    res.json(dashboardSummary(files,[...events,...history],{days:req.query.days??7,timeZone:req.query.timeZone??'UTC'}));
+  }catch(error){res.status(error.status===400?400:503).json({error:error.status===400?error.message:'Dashboard data could not be loaded. Please retry.'});}
+});
 app.get("/api/files", (_req, res) => {
   const list = [...documents.values()].filter(owns).map(listDocumentMetadata).sort((a, b) => b.uploadedAt.localeCompare(a.uploadedAt));
   res.json(list);
@@ -750,10 +762,12 @@ app.post("/api/conversations/:id/messages", async (req, res) => {
       return res.status(404).json({ error: "Conversation not found." });
     }
 
+    if(role==='user'&&!storageReadOnly)await workspaceActivity.record(req.ownerHash,`question:${req.params.id}:${message.id}`,'question',message.createdAt);
+
     res.status(201).json(message);
   } catch (error) {
     console.error("Conversation message error:", error);
-    res.status(500).json({ error: "Could not save conversation message." });
+    res.status(error.status===409?409:500).json({ error: error.status===409?error.message:"Could not save conversation message." });
   }
 });
 
@@ -1326,8 +1340,10 @@ function userFacingGeminiError(error) {
 
 async function validateQuestionRequest(req, res) {
   const { fileId, question, conversationId, selectedSheet = null } = req.body || {};
+  let selectedConversation;
   if(conversationId!==undefined){
     const conversation=await conversationStore.get(conversationId,req.ownerHash);
+    selectedConversation=conversation;
     if(!ownsConversation(conversation)){res.status(404).json({error:'Selected conversation is unavailable. No other conversation has been substituted.'});return null;}
     if(conversation.fileId!==fileId){res.status(409).json({error:'The selected conversation belongs to a different file. Reload that conversation before asking.'});return null;}
   }
@@ -1336,6 +1352,14 @@ async function validateQuestionRequest(req, res) {
   if (!doc) { res.status(404).json({ error: "Uploaded file not found. Please upload it again." }); return null; }
   if (typeof question !== "string" || !question.trim()) { res.status(400).json({ error: "Please enter a question." }); return null; }
   if(selectedSheet!==null&&(doc.kind!=='spreadsheet'||typeof selectedSheet!=='string'||!doc.sheets.some(sheet=>sheet.name===selectedSheet))){res.status(400).json({error:'Selected worksheet is invalid for this file. Choose an existing worksheet.'});return null;}
+  const questionId=req.body.questionId;
+  if(questionId!==undefined&&!isRequestId(questionId)){res.status(400).json({error:'A valid question request ID is required.'});return null;}
+  const saved=selectedConversation?.messages?.filter(message=>message.role==='user').findLast(message=>questionId?message.id===questionId:message.text===question.trim());
+  if(questionId&&selectedConversation&&(!saved||saved.text!==question.trim())){res.status(409).json({error:'The question request does not match the saved conversation.'});return null;}
+  if(!storageReadOnly){
+    try{await workspaceActivity.record(req.ownerHash,saved?`question:${conversationId}:${saved.id}`:`question:request:${fileId}:${questionId||crypto.randomUUID()}`,'question',saved?.createdAt);}
+    catch{res.status(503).json({error:'Could not record the submitted question. Please retry.'});return null;}
+  }
   return { doc, question: question.trim(), selectedSheet };
 }
 
@@ -1442,6 +1466,7 @@ async function startServer() {
 
     // Connect to MongoDB first
     await connectDB();
+    workspaceActivity=new WorkspaceActivityStore(getDB());if(!storageReadOnly)await workspaceActivity.initialize();
     authentication=await createAuthentication({db:getDB(),secret:process.env.SESSION_SECRET,allowedOrigins,production:process.env.NODE_ENV==='production',
       secure:process.env.AUTH_COOKIE_SECURE===undefined?process.env.NODE_ENV==='production':process.env.AUTH_COOKIE_SECURE==='true',
       sameSite:process.env.AUTH_COOKIE_SAMESITE?.toLowerCase()||(process.env.NODE_ENV==='production'?'none':'lax'),
