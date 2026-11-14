@@ -1,6 +1,5 @@
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import assert from 'node:assert/strict';
 import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
@@ -42,9 +41,9 @@ for (const mode of ['raw-exceljs','prepared-exceljs','direct-parser','worker-par
 }
 if (process.argv[3]) {
   const base=process.argv[3].replace(/\/$/,'');
-  const headers={'X-Workspace-Token':crypto.randomBytes(32).toString('hex')};
+  const {diagnosticClient}=await import('./diagnostic-auth.js'),client=await diagnosticClient(base);
   const form=new FormData();form.append('file',new Blob([buffer]),path.basename(filename));
-  const response=await fetch(`${base}/api/files/upload`,{method:'POST',headers,body:form});
+  const response=await client.request('/files/upload',{method:'POST',body:form});
   const result=await response.json();
   console.log('HTTP upload',{base,status:response.status,error:result.error,sheetNames:result.sheetNames,sheetCount:result.sheetCount,rowCount:result.rowCount,columnCount:result.columnCount,totalRowCount:result.totalRowCount,worksheets:result.worksheets});
   if(response.ok) {
@@ -55,14 +54,14 @@ if (process.argv[3]) {
       assert.deepEqual(result.worksheets.map(({name,rowCount,columnCount})=>({name,rowCount,columnCount})), expected.map(sheet => ({name:sheet.name,rowCount:sheet.rows,columnCount:sheet.columns})));
       assert.equal(result.totalRowCount, expected.reduce((total, sheet) => total + sheet.rows, 0));
       for(const sheet of result.sheetNames) {
-        const response=await fetch(`${base}/api/analytics/${result.fileId}?sheet=${encodeURIComponent(sheet)}`,{headers});
+        const response=await client.request(`/analytics/${result.fileId}?sheet=${encodeURIComponent(sheet)}`);
         const stats=await response.json();console.log('HTTP analytics',{sheet,status:response.status,rows:stats.rowCount,columns:stats.columnCount,error:stats.error});
         assert.equal(response.status, 200);validateAnalysis(stats);
         assert.equal(stats.rowCount, expected.find(item => item.name === sheet).rows);
         assert.equal(stats.columnCount, expected.find(item => item.name === sheet).columns);
       }
       for(const format of ['pdf','xlsx']) {
-        const report=await fetch(`${base}/api/reports/${result.fileId}.${format}`,{headers});
+        const report=await client.request(`/reports/${result.fileId}.${format}`);
         const bytes = Buffer.from(await report.arrayBuffer());
         console.log('HTTP report',{format,status:report.status,bytes:bytes.length});
         assert.equal(report.status,200);
@@ -70,8 +69,9 @@ if (process.argv[3]) {
         else { const exported = new ExcelJS.Workbook();await exported.xlsx.load(bytes);assert.equal(exported.getWorksheet('Selected Data').rowCount,expected[0].rows+1); }
       }
     } finally {
-      const removed=await fetch(`${base}/api/files/${result.fileId}`,{method:'DELETE',headers});
+      const removed=await client.request(`/files/${result.fileId}`,{method:'DELETE'});
       console.log('Diagnostic upload cleanup',{status:removed.status});
+      await client.logout();
     }
-  } else process.exitCode=1;
+  } else {await client.logout();process.exitCode=1;}
 }

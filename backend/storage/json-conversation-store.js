@@ -61,10 +61,10 @@ export class JsonConversationStore {
     return conversation;
   }
 
-  async get(id) {
+  async get(id,ownerHash) {
     if(typeof id!=='string'||!id)return null;
     const conversation = await this.getCollection().findOne({
-      $or: [{ _id: id }, { id }]
+      $or: [{ _id: id }, { id }],...(ownerHash?{ownerHash}:{})
     });
 
     if (!conversation) return null;
@@ -92,10 +92,10 @@ export class JsonConversationStore {
     }));
   }
 
-  async append(id, input) {
+  async append(id, input,ownerHash) {
     const collection = this.getCollection();
 
-    const conversation = await this.get(id);
+    const conversation = await this.get(id,ownerHash);
     if (!conversation) return null;
 
     const message = {
@@ -134,6 +134,7 @@ export class JsonConversationStore {
     const result = await collection.updateOne(
       {
         $or: [{ _id: id }, { id }],
+        ...(ownerHash?{ownerHash}:{}),
         updatedAt: conversation.updatedAt
       },
       {
@@ -151,17 +152,17 @@ export class JsonConversationStore {
     return message;
   }
 
-  async delete(id) {
+  async delete(id,ownerHash) {
     const result = await this.getCollection().deleteOne({
-      $or: [{ _id: id }, { id }]
+      $or: [{ _id: id }, { id }],...(ownerHash?{ownerHash}:{})
     });
 
     return result.deletedCount > 0;
   }
 
-  async deleteForFile(fileId) {
+  async deleteForFile(fileId,ownerHash) {
     await this.getCollection().deleteMany({
-      fileId
+      fileId,...(ownerHash?{ownerHash}:{})
     });
   }
   async assignOwner(id, ownerHash) {

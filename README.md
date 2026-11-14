@@ -4,7 +4,8 @@ AI-assisted spreadsheet and PDF analysis built with React, Vite, Node.js, Expres
 
 ## Requirements
 
-- Node.js 20 or later
+- Node.js 22 or later (verified on Node.js 24.21.0)
+- MongoDB for accounts and server-side sessions
 - A Gemini API key for Gemini-backed answers (local spreadsheet calculations work without provider calls)
 
 ## Configure the backend
@@ -12,10 +13,11 @@ AI-assisted spreadsheet and PDF analysis built with React, Vite, Node.js, Expres
 ```powershell
 cd backend
 npm install
-Copy-Item .env.example .env
+if (!(Test-Path .env)) { Copy-Item .env.example .env }
+npm run auth:configure
 ```
 
-Set `GEMINI_API_KEY` in `backend/.env`. The default application safety controls are a maximum of 15 provider requests per UTC day, one active provider request per backend process, and at least 15 seconds between requests. These are application-side controls and do not change Google project quotas.
+Set `MONGODB_URI` in `backend/.env` and start MongoDB. `auth:configure` appends a random signing secret to the ignored local `.env` without printing it or replacing an existing secret. Set `GEMINI_API_KEY` for provider-backed answers. The default application safety controls are a maximum of 15 provider requests per UTC day, one active provider request per backend process, and at least 15 seconds between requests. These are application-side controls and do not change Google project quotas.
 
 Run the backend:
 
@@ -47,48 +49,42 @@ The existing Dashboard layout and chart components are preserved. Upload XLSX or
 
 ### Backend and local setup
 
-Install dependencies with `npm install` in both `backend` and `frontend`. The existing MongoDB conversation store remains the default: set `MONGODB_URI` and start MongoDB before `npm run dev` in `backend`. For standalone development without MongoDB, set `CONVERSATION_STORAGE=file` in `backend/.env`. This uses the same file and conversation APIs with persistent local JSON conversations. Gemini is optional for Analytics, Reports and local chat calculations.
+Install dependencies with `npm install` in both `backend` and `frontend`. MongoDB is required for accounts and sessions. The default also stores conversations and document backups in MongoDB/GridFS. `CONVERSATION_STORAGE=file` may still select local document/conversation storage, but does not disable authentication or replace the MongoDB account/session store. Gemini is optional for Analytics, Reports and local chat calculations.
 
-In a second terminal run `npm run dev` in `frontend`. Production verification: `npm run build` in `frontend`; tests: `npm test` in `backend`. Integration tests use isolated temporary storage and a mock Gemini service, without a real API key or MongoDB.
+In a second terminal run `npm run dev` in `frontend`. Production verification: `npm run build` in `frontend`; tests: `npm test` in `backend`. Tests start their own temporary local MongoDB and mock Gemini service; your configured database and API key are not used. The first test run downloads an isolated MongoDB binary into ignored local test storage.
 
-### Private workspaces and existing uploads
+### Accounts, sessions and existing uploads
 
-This application has no account login. File access is isolated by a random private browser workspace token, sent as `X-Workspace-Token`; the backend stores only its SHA-256 hash. File lists, previews, analytics, reports, chat and conversation access all check ownership. Keep the token private. Clearing browser storage loses access to that browser's uploads; this is browser workspace isolation, not account authentication or cross-device sign-in.
+Sign up with a unique username and strong password, then save the ten one-time recovery codes shown once. No email or Google account is required. Passwords use Argon2id. Accounts and signed server-side sessions are stored in MongoDB; browsers use HttpOnly session cookies and session-bound CSRF headers. Login/account rate limits, idle/absolute expiration, session rotation, logout revocation and recovery-code replay protection are enforced by the backend. See [authentication setup and verification](backend/authentication.md).
 
-All frontend requests now use `src/api.js`: one dedicated Axios client for upload, lists, previews, Analytics, Chat and blob report downloads, plus a fetch wrapper for streamed Chat. Both obtain the same token from `src/workspace.js` before sending a request. The existing `technovalens.workspaceToken` storage key is retained, so valid existing workspace identities survive this update. If storage is blocked or changes during a session, requests stop with an explanatory message; the app never silently creates a temporary identity or retries an upload under a different identity. Report downloads send the token in a header and download the returned blob; tokens are never added to download URLs.
+All document, upload/progress, chat, history, analytics and report endpoints require an authenticated account. The frontend Axios client and streaming fetch wrapper send credentials; session/CSRF secrets are never stored in localStorage or download URLs. Browser preferences are scoped by account ID. Logging out or changing accounts unmounts the old workspace.
 
-#### Deploying frontend and backend together
+Existing anonymous documents and conversations are preserved with their original ownership. They are not automatically assigned to new accounts, and presenting a legacy X-Workspace-Token does not grant access. There is no self-service claim or username-only reset path. Historical ownership changes require a separately reviewed administrator process; do not run the old workspace-assignment helper to claim account data.
 
-The live frontend at `https://technovahub.in/technovalens` currently points to `https://technovalens.onrender.com`. Set `VITE_API_URL=https://technovalens.onrender.com` in the frontend **build environment**, run `npm ci` and `npm run build` in `frontend`, and deploy the generated `dist` contents under `/technovalens/`. A trailing `/api` is accepted and normalized. Without this setting, production uses same-origin `/api`, which requires a reverse proxy to the backend. Never use `http://localhost:5000` as the backend of the public HTTPS frontend: that addresses the visitor's computer. Local development uses Vite's `/api` proxy and defaults to port 5000.
+#### HTTPS hosting configuration
 
-Deploy the backend source from the same revision and restart it. Preserve its document/conversation storage and do not change existing ownership hashes. `/api/health` now advertises `workspaceAuth: { version: 1, header: "X-Workspace-Token" }`. Keep `https://technovahub.in` allowed by CORS, including the `X-Workspace-Token` request header. Missing or invalid tokens still return HTTP 401 before upload processing, with the additive code `WORKSPACE_TOKEN_REQUIRED`.
+Set NODE_ENV=production, provide a separate random SESSION_SECRET, and set AUTH_TRUST_PROXY_HOPS to the exact number of trusted HTTPS proxy hops (normally 1 for Render, default 0). Production rejects insecure authentication requests. Cookies are Secure and HttpOnly, with SameSite=None for the existing cross-site frontend/backend origins; same-site deployments may use Lax. Add only exact trusted frontend origins using AUTH_ALLOWED_ORIGINS. CORS must allow credentials and X-CSRF-Token.
 
-After deployment, reload the frontend without clearing site storage. In DevTools, check the failed request's URL and whether its request headers contain `X-Workspace-Token` (do not share its value). A direct browser navigation to a protected API URL does not attach this header and is expected to return 401. A stale open tab can still run an older frontend bundle; changing build environment variables requires rebuilding, not just restarting the backend. Tests in `backend/tests/workspace.test.js` and `workspace-api.test.js` cover identity initialization, refresh, blocked storage, isolation, actual upload/analytics/chat requests and PDF/XLSX downloads.
+The existing frontend API build URL and routes are unchanged. For the documented backend use VITE_API_URL=https://technovalens.onrender.com during the frontend build. Cross-site cookies can be blocked by browser privacy settings: host the API on the same site or behind a same-origin HTTPS reverse proxy if necessary; do not weaken cookie or CSRF protection. No deployment was performed by this implementation.
 
-Older uploads have no recorded owner, so the server cannot safely show them to every browser. Their stored data is preserved. Re-upload them, or have the server administrator assign legacy uploads from a **single known owner**:
-
-1. Open the app in that owner's browser. In its developer console, read `localStorage.getItem('technovalens.workspaceToken')`.
-2. Stop the backend. In the backend PowerShell terminal set `$env:WORKSPACE_TOKEN = '<that private token>'` and run `npm run migrate:workspace`.
-3. Remove the temporary variable with `Remove-Item Env:WORKSPACE_TOKEN`, restart the backend, and refresh the app. Existing file IDs and linked conversations are retained.
-
-The migration only assigns currently unowned files. Do not use the bulk migration on legacy storage belonging to multiple people; first separate records by verified ownership. Already owned files are never reassigned.
+GET /api/health is public and advertises workspaceAuth: { version: 2, method: "session-cookie" }. GET /api/auth/session initializes a CSRF-protected browser session and returns the current public user or null. Unauthenticated protected requests return 401 with code AUTH_REQUIRED. Another account's documents return 404. See the authentication guide for the remaining account routes and recovery behavior.
 
 ### Analytics and report APIs
 
-All routes require `X-Workspace-Token: <64 lowercase hexadecimal characters>`. Missing tokens return 401; another workspace's file returns 404. JSON errors use `{ "error": "message" }`.
+All routes require an authenticated HttpOnly session cookie. Mutating requests also require `X-CSRF-Token`. Missing sessions return 401; another account's file returns 404. JSON errors use `{ "error": "message" }`.
 
 | Endpoint | Response |
 | --- | --- |
 | `GET /api/analytics/:id` | Workbook metadata, generation date, sheet counts, inferred types, KPIs, numeric/quality statistics, charts, findings, warnings |
 | `GET /api/analytics/:id/preview` | `{ columns, rows, page, pageSize, total, totalPages }` |
 | `GET /api/reports/:id.pdf` | Paginated PDF report |
-| `GET /api/reports/:id.xlsx` | Excel report with five summary/data worksheets |
+| `GET /api/reports/:id.xlsx` | Excel report with six dashboard/summary/data worksheets |
 
 All accept optional `sheet`, `search`, `categoryColumn` and `categoryValue`. Preview also accepts `sort`, `direction=asc|desc`, `page` and `pageSize` (1–100). Invalid sheet names return 400. Existing `/api/files`, `/api/files/upload`, `/api/excel/upload`, preview and conversation endpoints remain available under the same workspace protection.
 
-Implementation: `frontend/src/AnalyticsReports.jsx`, `frontend/src/workspace.js` and scoped additions in `styles.css`; integration in `App.jsx` and the local proxy default in `vite.config.js`. Backend changes are in `analytics.js`, `spreadsheet-parser.js`, `reports.js`, `server.js`, the optional `storage/file-conversation-store.js`, and `migrate-workspace.js`. Coverage lives in `backend/tests/analytics-reports.test.js`; the existing API suite now sends workspace credentials.
+Implementation: `frontend/src/AnalyticsReports.jsx`, `frontend/src/workspace.js` and scoped additions in `styles.css`; integration in `App.jsx` and the local proxy default in `vite.config.js`. Backend changes are in `analytics.js`, `spreadsheet-parser.js`, `reports.js`, `server.js`, the optional `storage/file-conversation-store.js`, and `migrate-workspace.js`. Coverage lives in `backend/tests/analytics-reports.test.js`; the API suite uses isolated authenticated accounts.
 
-An optional `backend/tests/browser-smoke.mjs` checks upload, Recharts, filtering, report PDF downloads, selection persistence and mobile overflow. With Playwright installed locally (or `PLAYWRIGHT_MODULE` pointing to an existing installation), run `node backend/tests/browser-smoke.mjs` from the project root. It requires port 5173 to be free, starts isolated servers, and deletes its temporary data afterward.
+Run `node tests/run-tests.js --auth-ui` from `backend` for the isolated authenticated Edge browser smoke test, including desktop/mobile login and signup, upload, logout, recovery and restored document access. See the authentication guide for requirements. The older optional `tests/browser-smoke.mjs` predates account authentication.
 
 ### Local upload diagnostics
 
@@ -104,7 +100,7 @@ To inspect a workbook and perform an authenticated multipart upload through the 
 node diagnose-spreadsheet.mjs 'C:/Users/Admin/Downloads/TECHNOVALENS_Sample_Business_Data.xlsx' http://localhost:5173
 ```
 
-The command compares raw ExcelJS loading, compatibility preparation, direct parsing and worker parsing. It reports upload status, worksheet counts, Analytics for every sheet and both report downloads. It uses a fresh private diagnostic workspace, never prints its token and removes its test upload afterward. Both backend (`npm run dev`, port 5000) and frontend (`npm run dev`, port 5173) must be running. The development proxy defaults to `http://localhost:5000`; a frontend `.env` setting can override it.
+HTTP diagnostics now require a dedicated existing account through `TECHNOVALENS_DIAGNOSTIC_USERNAME` and `TECHNOVALENS_DIAGNOSTIC_PASSWORD` in private terminal environment variables. Credentials are never printed; only files created by the diagnostic are cleaned up. The command compares raw ExcelJS loading, compatibility preparation, direct parsing and worker parsing. It reports upload status, worksheet counts, Analytics for every sheet and both report downloads. It logs in with a separate diagnostic session, never prints credentials and removes its test upload afterward. Both backend (`npm run dev`, port 5000) and frontend (`npm run dev`, port 5173) must be running. The development proxy defaults to `http://localhost:5000`; a frontend `.env` setting can override it.
 
 ## AI usage controls
 
@@ -116,7 +112,7 @@ New uploads use `storageVersion: 2` metadata and a sibling `<fileId>.sheets` dir
 
 The original **256 MiB old-generation worker heap**, **30-second timeout**, **50 MiB upload limit**, **128 MiB expanded ZIP limit**, **32 sheets**, **100,000 data rows**, **256 populated columns** and **2,000,000 cells** remain enforced. `SPREADSHEET_WORKER_HEAP_MB` is clamped to 128–512 MiB (default 256), `SPREADSHEET_WORKERS` to 1–2 (default 1), and `SPREADSHEET_TIMEOUT_MS` to 1,000–120,000 ms (default 30,000). The same worker admission limit covers parsing and worksheet queries; at most eight lightweight worksheet queries may wait. Excess uploads receive 429. Timeouts, browser cancellation and disconnects terminate workers and clean up incomplete uploads. A worker heap cap is not a cap on total process RSS: buffers, native ZIP memory and the Express process also consume memory.
 
-The existing upload UI polls private `/api/files/upload-status/:job` status for worksheet discovery, processing and analysis, and offers cancellation. Job identifiers are not credentials; the workspace header is required for every status request. Completed jobs include parser elapsed time and sampled peak heap/RSS measurements. Logs contain counts/stages rather than cell contents or tokens.
+The existing upload UI polls private `/api/files/upload-status/:job` status for worksheet discovery, processing and analysis, and offers cancellation. Job identifiers are not credentials; an authenticated session cookie is required for every status request. Completed jobs include parser elapsed time and sampled peak heap/RSS measurements. Logs contain counts/stages rather than cell contents or tokens.
 
 Local validation (no deployment):
 

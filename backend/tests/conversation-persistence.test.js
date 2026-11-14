@@ -59,7 +59,7 @@ test('durable normalized files and manifests restore into an empty deployment ca
     await fs.rm(path.join(dir,`${fileId}.sheets`),{recursive:true});
     const replacement=new MongoDocumentStore(fake.db,dir,fake.bucket);assert.deepEqual(await replacement.restore(),[document]);
     assert.equal(await fs.readFile(path.join(dir,`${fileId}.sheets/sheet-1.ndjson`),'utf8'),'[125]\n');
-    await replacement.delete(fileId);assert.equal(fake.blobs.size,0);assert.equal(fake.records.size,0);
+    await replacement.delete(fileId,document.ownerHash);assert.equal(fake.blobs.size,0);assert.equal(fake.records.size,0);
     fake.setFailure(true);await assert.rejects(store.save(document),/storage interrupted/);assert.equal(fake.records.size,0);assert.equal(fake.blobs.size,0);
   }finally{await fs.rm(dir,{recursive:true,force:true});}
 });

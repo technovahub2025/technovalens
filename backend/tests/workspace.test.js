@@ -102,5 +102,5 @@ test('workspace tokens cannot be sent to another origin or outside the configure
   const deployed=recordingApi(storage(),'http://localhost:5000/api');
   await assert.rejects(deployed.client.get('/files'),{code:'WORKSPACE_API_CONFIG'});
   assert.equal(deployed.requests.length,0);
-  assert.match(workspaceFailureMessage({response:{status:401}}),/private workspace/);
+  assert.match(workspaceFailureMessage({response:{status:401}}),/sign-in session/);
 });

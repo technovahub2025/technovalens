@@ -20,6 +20,7 @@ import { MongoDocumentStore } from './storage/mongo-document-store.js';
 import { planSpreadsheetQuestion, answerSheetQuestion, resolveWorksheetScope } from './exact-spreadsheet.js';
 import { JsonConversationStore } from "./storage/json-conversation-store.js";
 import { LocalDocumentCache } from './storage/local-document-cache.js';
+import {createAuthentication} from './auth.js';
 
 // Resolve the backend .env from this file, regardless of the directory used to start Node.
 const envPath = fileURLToPath(new URL("./.env", import.meta.url));
@@ -43,7 +44,12 @@ if (GEMINI_API_BASE_URL) {
 }
 
 const app = express();
+app.disable('x-powered-by');
+const proxyHops=Number(process.env.AUTH_TRUST_PROXY_HOPS??0);
+if(!Number.isInteger(proxyHops)||proxyHops<0||proxyHops>3)throw new Error('AUTH_TRUST_PROXY_HOPS must be an integer from 0 to 3.');
+app.set('trust proxy',proxyHops);
 let localCache;
+let authentication;
 const storageReadOnly=process.env.STORAGE_READ_ONLY==='true';
 
 const allowedOrigins = new Set([
@@ -52,6 +58,11 @@ const allowedOrigins = new Set([
   "https://technovahub.in",
   "https://www.technovahub.in"
 ]);
+for(const origin of (process.env.AUTH_ALLOWED_ORIGINS||'').split(',').map(value=>value.trim()).filter(Boolean)){
+  let parsed;try{parsed=new URL(origin);}catch{throw new Error('AUTH_ALLOWED_ORIGINS must contain exact HTTP(S) origins.');}
+  if(!['http:','https:'].includes(parsed.protocol)||parsed.origin!==origin)throw new Error('AUTH_ALLOWED_ORIGINS must contain exact HTTP(S) origins, without paths or wildcards.');
+  allowedOrigins.add(origin);
+}
 
 const corsOptions = {
   origin: (origin, callback) => {
@@ -63,7 +74,7 @@ const corsOptions = {
   },
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "X-Workspace-Token"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Workspace-Token", "X-CSRF-Token"],
   optionsSuccessStatus: 204
 };
 
@@ -72,18 +83,21 @@ const corsOptions = {
 app.use(cors(corsOptions));
 
 app.use(express.json({ limit: "2mb" }));
+app.use('/api',(req,res,next)=>{
+  if(req.path==='/health'||req.method==='OPTIONS')return next();
+  if(!authentication)return res.status(503).json({error:'Authentication is not ready.'});
+  authentication.middleware(req,res,next);
+});
 
-// Scope every file lookup to the private browser workspace. Tokens are never persisted raw.
+// Ownership comes only from the authenticated account. Legacy browser tokens
+// cannot claim anonymous documents or change the current user's scope.
 const workspaceContext = new AsyncLocalStorage();
 const owns = document => Boolean(document && document.ownerHash === workspaceContext.getStore());
 app.use('/api', (req, res, next) => {
-  if (['/health', '/usage'].includes(req.path) || req.method === 'OPTIONS') return next();
+  if (req.path==='/health' || req.method === 'OPTIONS') return next();
   res.set('Cache-Control', 'no-store');
-  const token = req.get('X-Workspace-Token') || '';
-  if (!/^[a-f0-9]{64}$/.test(token)) return res.status(401).json({ error: 'A private workspace token is required. Reload the application.', code: 'WORKSPACE_TOKEN_REQUIRED' });
-  const hash = crypto.createHash('sha256').update(token).digest('hex');
-  req.ownerHash = hash;
-  workspaceContext.run(hash, () => next());
+  if(!req.ownerHash)return res.status(401).json({code:'AUTH_REQUIRED',error:'Please sign in to continue.'});
+  workspaceContext.run(req.ownerHash, () => next());
 });
 
 app.use('/api',(req,res,next)=>{
@@ -105,7 +119,7 @@ for(const method of ['get','post','delete','put','patch']){
         let fileId=req.body?.fileId;
         if(/^\/api\/(?:files|analytics|reports|excel)\/:id/.test(String(req.route.path)))fileId=req.params.id;
         if(req.method==='POST'&&String(req.route.path)==='/api/conversations/:id/messages'){
-          const conversation=await conversationStore.get(req.params.id);if(ownsConversation(conversation))fileId=conversation.fileId;
+          const conversation=await conversationStore.get(req.params.id,req.ownerHash);if(ownsConversation(conversation))fileId=conversation.fileId;
         }
         if(fileId&&localCache)await localCache.ensure(fileId,req.ownerHash);
         await handler(req,res,next);
@@ -295,7 +309,7 @@ const MAX_GEMINI_CONCURRENCY = 1;
 let activeGeminiRequests = 0;
 let lastGeminiRequestAt = 0;
 const geminiWaiters = [];
-app.get("/api/health", (_req, res) => res.json({ status: "ok", app: "TECHNOVALENS API", workspaceAuth: { version: 1, header: "X-Workspace-Token" }, storage:{readOnly:storageReadOnly,cacheExpirationEnabled:Boolean(localCache?.enabled)} }));
+app.get("/api/health", (_req, res) => res.json({ status: "ok", app: "TECHNOVALENS API", workspaceAuth: { version: 2, method: "session-cookie" }, storage:{readOnly:storageReadOnly,cacheExpirationEnabled:Boolean(localCache?.enabled)} }));
 app.get("/api/usage", (_req, res) => {
   rollUsageDay();
   res.json({
@@ -633,7 +647,7 @@ async function receiveFile(req, res) {
       const cleanupStarted=performance.now();
       try{
         const cleanup=[];
-        if(createdId){documents.delete(createdId);clearSheetCache(createdId);if(sheetDirectory)cleanup.push(()=>fs.rmSync(sheetDirectory,{recursive:true,force:true}));cleanup.push(()=>fs.rmSync(path.join(documentStorePath,`${createdId}.json`),{force:true}),()=>conversationStore.deleteForFile(createdId));if(durableDocuments)cleanup.push(()=>durableDocuments.delete(createdId));}
+        if(createdId){documents.delete(createdId);clearSheetCache(createdId);if(sheetDirectory)cleanup.push(()=>fs.rmSync(sheetDirectory,{recursive:true,force:true}));cleanup.push(()=>fs.rmSync(path.join(documentStorePath,`${createdId}.json`),{force:true}),()=>conversationStore.deleteForFile(createdId,req.ownerHash));if(durableDocuments)cleanup.push(()=>durableDocuments.delete(createdId,req.ownerHash));}
         if(metadataTemporaryPath)cleanup.push(()=>fs.rmSync(metadataTemporaryPath,{force:true}));
         const outcomes=await Promise.allSettled(cleanup.map(action=>Promise.resolve().then(action)));
         const failed=outcomes.find(outcome=>outcome.status==='rejected');if(failed)throw failed.reason;
@@ -665,7 +679,7 @@ app.get("/api/files/:id", (req, res) => {
   res.json(describeDocument(document));
 });
 
-const ownsConversation=conversation=>Boolean(conversation&&(conversation.ownerHash===workspaceContext.getStore()||!conversation.ownerHash&&getDocument(conversation.fileId)));
+const ownsConversation=conversation=>Boolean(conversation&&conversation.ownerHash===workspaceContext.getStore());
 const publicConversation=conversation=>{const {ownerHash,...visible}=conversation;return visible;};
 app.get("/api/conversations", async (req, res) => {
   try {
@@ -701,7 +715,7 @@ app.post("/api/conversations", async (req, res) => {
 
 app.get("/api/conversations/:id", async (req, res) => {
   try {
-    const conversation = await conversationStore.get(req.params.id);
+    const conversation = await conversationStore.get(req.params.id,req.ownerHash);
 
     if (!ownsConversation(conversation)) {
       return res.status(404).json({ code:'CONVERSATION_UNAVAILABLE',error: "This saved conversation is unavailable in this workspace. Its history has not been replaced. Select another conversation or restore the original storage backup." });
@@ -716,7 +730,7 @@ app.get("/api/conversations/:id", async (req, res) => {
 
 app.post("/api/conversations/:id/messages", async (req, res) => {
   try {
-    const conversation = await conversationStore.get(req.params.id);
+    const conversation = await conversationStore.get(req.params.id,req.ownerHash);
 
     if (!ownsConversation(conversation)) {
       return res.status(404).json({ error: "Conversation not found." });
@@ -739,7 +753,7 @@ app.post("/api/conversations/:id/messages", async (req, res) => {
 
     const message = await conversationStore.append(
       req.params.id,
-      { ...req.body, role, text: text.trim() }
+      { ...req.body, role, text: text.trim() },req.ownerHash
     );
 
     if (!message) {
@@ -755,9 +769,9 @@ app.post("/api/conversations/:id/messages", async (req, res) => {
 
 app.delete("/api/conversations/:id", async (req, res) => {
   try {
-    const conversation = await conversationStore.get(req.params.id);
+    const conversation = await conversationStore.get(req.params.id,req.ownerHash);
     if (!ownsConversation(conversation)) return res.status(404).json({ error: 'Conversation not found.' });
-    const deleted = await conversationStore.delete(req.params.id);
+    const deleted = await conversationStore.delete(req.params.id,req.ownerHash);
 
     if (!deleted) {
       return res.status(404).json({ error: "Conversation not found." });
@@ -844,10 +858,10 @@ app.delete("/api/files/:id", async (req, res) => {
     }
   }
   documents.delete(req.params.id);
-  if(durableDocuments)await durableDocuments.delete(document.fileId);
+  if(durableDocuments)await durableDocuments.delete(document.fileId,req.ownerHash);
   clearSheetCache(req.params.id);
   if(document.storageVersion===2)fs.rmSync(path.join(documentStorePath,`${document.fileId}.sheets`),{recursive:true,force:true});
-  await conversationStore.deleteForFile(req.params.id);
+  await conversationStore.deleteForFile(req.params.id,req.ownerHash);
   res.json({ status: "removed" });
 });
 const gemini = GEMINI_API_KEY
@@ -1323,7 +1337,7 @@ function userFacingGeminiError(error) {
 async function validateQuestionRequest(req, res) {
   const { fileId, question, conversationId, selectedSheet = null } = req.body || {};
   if(conversationId!==undefined){
-    const conversation=await conversationStore.get(conversationId);
+    const conversation=await conversationStore.get(conversationId,req.ownerHash);
     if(!ownsConversation(conversation)){res.status(404).json({error:'Selected conversation is unavailable. No other conversation has been substituted.'});return null;}
     if(conversation.fileId!==fileId){res.status(409).json({error:'The selected conversation belongs to a different file. Reload that conversation before asking.'});return null;}
   }
@@ -1437,7 +1451,11 @@ async function startServer() {
     }
 
     // Connect to MongoDB first
-    if (process.env.CONVERSATION_STORAGE !== "file") await connectDB();
+    await connectDB();
+    authentication=await createAuthentication({db:getDB(),secret:process.env.SESSION_SECRET,allowedOrigins,production:process.env.NODE_ENV==='production',
+      secure:process.env.AUTH_COOKIE_SECURE===undefined?process.env.NODE_ENV==='production':process.env.AUTH_COOKIE_SECURE==='true',
+      sameSite:process.env.AUTH_COOKIE_SAMESITE?.toLowerCase()||(process.env.NODE_ENV==='production'?'none':'lax'),
+      ...(process.env.NODE_ENV==='test'?{limits:{ip:1000,account:200,signupIp:200}}:{})});
 
     // Initialize MongoDB conversation storage
     conversationStore = process.env.CONVERSATION_STORAGE === "file" ? new FileConversationStore(DATA_DIR) : new JsonConversationStore(DATA_DIR);

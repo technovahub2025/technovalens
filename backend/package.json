@@ -9,15 +9,19 @@
     "test": "node tests/run-tests.js",
     "verify:models": "node verify-models.js",
     "migrate:workspace": "node migrate-workspace.js",
-    "audit:storage": "node audit-storage.mjs"
+    "audit:storage": "node audit-storage.mjs",
+    "auth:configure": "node configure-auth.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.32.0",
+    "argon2": "^0.45.2",
+    "connect-mongo": "^6.0.0",
     "cors": "^2.8.5",
     "csv-parse": "^7.0.3",
     "dotenv": "^16.4.7",
     "exceljs": "^4.4.0",
     "express": "^4.21.2",
+    "express-session": "^1.19.0",
     "jszip": "^3.10.2",
     "mongodb": "^7.8.0",
     "multer": "^1.4.5-lts.1",
@@ -31,5 +35,8 @@
       "uuid": "^11.1.1",
       "minimatch": "^11.0.1"
     }
+  },
+  "devDependencies": {
+    "mongodb-memory-server-core": "^11.3.0"
   }
 }

@@ -109,5 +109,5 @@ export class MongoDocumentStore {
     return restored;
   }
   async has(fileId){return Boolean(await this.collection.findOne({_id:fileId,state:'ready'}));}
-  async delete(fileId){const item=await this.collection.findOne({_id:fileId});if(!item)return;await Promise.allSettled(item.blobIds.map(id=>this.bucket.delete(id)));await this.collection.deleteOne({_id:fileId});}
+  async delete(fileId,ownerHash){if(!ownerHash)throw new Error('Verified document ownership is required.');const item=await this.collection.findOne({_id:fileId,ownerHash});if(!item)return;await Promise.allSettled(item.blobIds.map(id=>this.bucket.delete(id)));await this.collection.deleteOne({_id:fileId,ownerHash});}
 }

@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity, BarChart3, Bot, ChevronDown, CircleHelp, CloudUpload,
   FileSpreadsheet, FileText, Files, LayoutDashboard,
-  MessageSquareText, MoreHorizontal, Send, Settings,
+  MessageSquareText, LogOut, Send, Settings,
   Sparkles, Trash2, TrendingUp, Users, X
 } from "lucide-react";
 import {
@@ -135,7 +135,8 @@ const nav = [
 // MAIN APP
 // =====================================================
 
-export default function App() {
+export default function App({authUser,onLogout,onManageRecovery}) {
+  const storageKey=name=>'technovalens.account.'+authUser.id+'.'+name;
   const [active, setActive] = useState(()=>initialPage(window.location));
   useEffect(()=>{
     const routes={'Dashboard':'dashboard','My Documents':'files','AI Assistant':'chat','Reports':'reports'};
@@ -149,11 +150,11 @@ export default function App() {
 
   const [file, setFile] = useState(null);
   const [fileInfo, setFileInfo] = useState(null);
-  const [chatWorksheets,setChatWorksheets]=useState(()=>{try{const stored=JSON.parse(localStorage.getItem('technovalens.chatWorksheets')||'{}');return stored&&typeof stored==='object'&&!Array.isArray(stored)?stored:{};}catch{return {};}});
+  const [chatWorksheets,setChatWorksheets]=useState(()=>{try{const stored=JSON.parse(localStorage.getItem(storageKey('chatWorksheets'))||'{}');return stored&&typeof stored==='object'&&!Array.isArray(stored)?stored:{};}catch{return {};}});
   const savedSheet=fileInfo&&Object.prototype.hasOwnProperty.call(chatWorksheets,fileInfo.fileId)?chatWorksheets[fileInfo.fileId]:fileInfo?.sheetName;
   const selectedSheet=fileInfo?.kind==='spreadsheet'&&fileInfo.sheetNames?.includes(savedSheet)?savedSheet:null;
   function selectChatWorksheet(name){
-    setChatWorksheets(previous=>{const next={...previous,[fileInfo.fileId]:name||null};try{localStorage.setItem('technovalens.chatWorksheets',JSON.stringify(next));}catch{}return next;});
+    setChatWorksheets(previous=>{const next={...previous,[fileInfo.fileId]:name||null};try{localStorage.setItem(storageKey('chatWorksheets'),JSON.stringify(next));}catch{}return next;});
   }
   const [preview, setPreview] = useState([]);
 
@@ -168,7 +169,7 @@ export default function App() {
 
   const [documents, setDocuments] = useState([]);
   const [selectedWorkbookId, setSelectedWorkbookId] = useState(() => {
-    try { return localStorage.getItem("technovalens.selectedWorkbookId") || ""; } catch { return ""; }
+    try { return localStorage.getItem(storageKey('selectedWorkbookId')) || ""; } catch { return ""; }
   });
   const [conversations, setConversations] = useState([]);
 
@@ -262,7 +263,7 @@ export default function App() {
 
       try {
         localStorage.setItem(
-          "technovalens.activeConversationId",
+          storageKey('activeConversationId'),
           chat.id
         );
       } catch {
@@ -345,7 +346,7 @@ export default function App() {
 
         try {
           selectedId = localStorage.getItem(
-            "technovalens.activeConversationId"
+            storageKey('activeConversationId')
           );
         } catch {
           // Browser storage may be disabled.
@@ -374,6 +375,7 @@ export default function App() {
     return () => {
       cancelled = true;
       chatControllerRef.current?.abort();
+      uploadControllerRef.current?.abort();
       openSequenceRef.current++;
     };
   }, []);
@@ -449,7 +451,7 @@ export default function App() {
       setFile(selected);
       if (data.kind === "spreadsheet") {
         setSelectedWorkbookId(data.fileId);
-        try { localStorage.setItem("technovalens.selectedWorkbookId", data.fileId); } catch { /* Storage may be disabled. */ }
+        try { localStorage.setItem(storageKey('selectedWorkbookId'), data.fileId); } catch { /* Storage may be disabled. */ }
       }
 
       setPreview(
@@ -467,7 +469,7 @@ export default function App() {
 
       try {
         localStorage.setItem(
-          "technovalens.activeConversationId",
+          storageKey('activeConversationId'),
           data.conversationId
         );
       } catch {
@@ -539,7 +541,7 @@ export default function App() {
 
     try {
       localStorage.removeItem(
-        "technovalens.activeConversationId"
+        storageKey('activeConversationId')
       );
     } catch {
       // Browser storage may be disabled.
@@ -1019,7 +1021,7 @@ export default function App() {
 
         <div className="sidebar-bottom">
 
-          <button className="nav-item">
+          <button className="nav-item" onClick={onManageRecovery} title="Manage account recovery codes">
             <Settings size={18} />
             <span>Settings</span>
           </button>
@@ -1028,11 +1030,11 @@ export default function App() {
             <div className="avatar">TV</div>
 
             <div>
-              <b>Workspace User</b>
-              <small>Free workspace</small>
+              <b>{authUser?.username||'Account'}</b>
+              <small>Private workspace</small>
             </div>
 
-            <MoreHorizontal size={18} />
+            <button type="button" className="icon-button" onClick={onLogout} aria-label="Sign out" title="Sign out"><LogOut size={18} /></button>
           </div>
 
         </div>
@@ -1859,7 +1861,7 @@ export default function App() {
               selectedId={selectedWorkbookId}
               onSelect={id => {
                 setSelectedWorkbookId(id);
-                try { localStorage.setItem("technovalens.selectedWorkbookId", id); } catch { /* Storage may be disabled. */ }
+                try { localStorage.setItem(storageKey('selectedWorkbookId'), id); } catch { /* Storage may be disabled. */ }
               }}
             />
 

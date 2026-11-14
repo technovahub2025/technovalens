@@ -39,7 +39,7 @@ export const workspaceIdentity = createWorkspaceIdentity();
 export function workspaceFailureMessage(error) {
   if (['WORKSPACE_CHANGED', 'WORKSPACE_UNAVAILABLE', 'WORKSPACE_API_CONFIG'].includes(error?.code)) return error.message;
   if ((error?.apiStatus || error?.response?.status) === 401) {
-    return 'Your private workspace could not be verified. Reload the application. If this continues, check that the latest frontend is deployed and its API URL points to the matching backend.';
+    return 'Your sign-in session has ended. Sign in again to continue.';
   }
   return '';
 }

@@ -6,12 +6,14 @@ import JSZip from 'jszip';
 import { SaxesParser } from 'saxes';
 import ExcelJS from 'exceljs';
 import { validateUpload,validateAnalysis,validatePreview } from '../frontend/src/api-contracts.js';
+import {diagnosticClient} from './diagnostic-auth.js';
 
 const filename=process.argv[2],base=(process.argv[3]||'http://localhost:5173').replace(/\/$/,'');
 if(!filename)throw new Error('Usage: node validate-large-workbook.mjs <workbook.xlsx> [http://localhost:5173]');
-const bytes=fs.readFileSync(filename),headers={'X-Workspace-Token':crypto.randomBytes(32).toString('hex')},created=[];
-const request=(route,options={})=>fetch(`${base}/api${route}`,{...options,headers:{...headers,...options.headers}});
+const bytes=fs.readFileSync(filename),created=[],client=await diagnosticClient(base);
+const request=client.request;
 const json=async(route)=>{const response=await request(route);const data=await response.json();assert.equal(response.status,200,JSON.stringify(data));return data;};
+const initialDocuments=(await json('/files')).length;
 
 // Independent XML oracle: no ExcelJS cell graph and no production parser code.
 const archive=await JSZip.loadAsync(bytes),strings=[];
@@ -44,7 +46,7 @@ try {
     assert.equal(response.status,200,JSON.stringify(file));validateUpload(file);created.push(file.fileId);
     assert.deepEqual(file.sheetNames,workbookSheets.map(sheet=>sheet.name));
     const progress=await json(`/files/upload-status/${job}`);assert.equal(progress.stage,'completed');
-    assert.equal((await fetch(`${base}/api/files/upload-status/${job}`,{headers:{'X-Workspace-Token':crypto.randomBytes(32).toString('hex')}})).status,404);
+    assert.equal((await fetch(`${base}/api/files/upload-status/${job}`,{headers:{'X-Workspace-Token':crypto.randomBytes(32).toString('hex')}})).status,401);
     const metrics={run:run+1,uploadMs:Math.round(performance.now()-started),...file.parserMetrics,parentAfterUpload:progress.memory};runs.push(metrics);console.log('Real upload:',metrics);
     if(run>0)continue;
     for(const meta of file.worksheets){
@@ -91,7 +93,7 @@ try {
   abort.abort();await cancellation;
   let failed=false;
   for(let attempt=0;attempt<100;attempt++){const response=await request(`/files/upload-status/${cancelledJob}`);if(response.ok&&(await response.json()).stage==='failed'){failed=true;break;}await new Promise(resolve=>setTimeout(resolve,50));}
-  assert.ok(failed);assert.equal((await json('/files')).length,created.length);console.log('Verified cancellation: no incomplete upload listed');
+  assert.ok(failed);assert.equal((await json('/files')).length,created.length+initialDocuments);console.log('Verified cancellation: no incomplete upload listed');
   }
   console.log('VALIDATION PASSED',JSON.stringify({worksheets:workbookSheets.length,runs,observedProgressStages:[...stages]}));
-}finally{for(const file of await json('/files')){const response=await request(`/files/${file.fileId}`,{method:'DELETE'});assert.equal(response.status,200);}}
+}finally{try{for(const fileId of created){const response=await request(`/files/${fileId}`,{method:'DELETE'});assert.equal(response.status,200);}}finally{await client.logout();}}

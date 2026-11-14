@@ -1,10 +1,11 @@
 import axios from 'axios';
-import { workspaceIdentity } from './workspace.js';
 import { resolveApiBase } from './api-config.js';
 export { resolveApiBase } from './api-config.js';
 
-export function createWorkspaceApi({ baseURL, identity = workspaceIdentity, pageOrigin = globalThis.location?.origin || 'http://localhost', fetchImpl = (...args) => globalThis.fetch(...args), adapter, configurationError } = {}) {
-  const client = axios.create({ baseURL, ...(adapter ? { adapter } : {}) });
+let csrfToken='';
+export const setCsrfToken=value=>{csrfToken=typeof value==='string'?value:'';};
+export function createWorkspaceApi({ baseURL, identity, getCsrfToken=()=>csrfToken, pageOrigin = globalThis.location?.origin || 'http://localhost', fetchImpl = (...args) => globalThis.fetch(...args), adapter, configurationError } = {}) {
+  const client = axios.create({ baseURL, withCredentials:true, ...(adapter ? { adapter } : {}) });
   const root = new URL(baseURL, pageOrigin);
   function checkTarget(url) {
     if (configurationError) throw Object.assign(new Error(configurationError.message), { code: 'WORKSPACE_API_CONFIG' });
@@ -21,15 +22,22 @@ export function createWorkspaceApi({ baseURL, identity = workspaceIdentity, page
   }
   client.interceptors.request.use(config => {
     checkTarget(client.getUri(config));
-    config.headers.set('X-Workspace-Token', identity.getToken(), true);
+    if(identity)config.headers.set('X-Workspace-Token', identity.getToken(), true);
+    if(!['get','head','options'].includes((config.method||'get').toLowerCase())){
+      const token=getCsrfToken();if(token)config.headers.set('X-CSRF-Token',token,true);
+      else if(!identity)throw Object.assign(new Error('Your sign-in session is not ready. Refresh the page.'),{code:'AUTH_CSRF_MISSING'});
+    }
     return config;
   });
   async function workspaceFetch(path, init = {}) {
     const url = client.getUri({ url: path });
     checkTarget(url);
     const headers = new Headers(init.headers);
-    headers.set('X-Workspace-Token', identity.getToken());
-    return fetchImpl(url, { ...init, headers });
+    if(identity)headers.set('X-Workspace-Token',identity.getToken());
+    if(!['GET','HEAD','OPTIONS'].includes((init.method||'GET').toUpperCase())){const token=getCsrfToken();if(token)headers.set('X-CSRF-Token',token);else if(!identity)throw Object.assign(new Error('Your sign-in session is not ready. Refresh the page.'),{code:'AUTH_CSRF_MISSING'});}
+    const response=await fetchImpl(url, { ...init, headers, credentials:'include' });
+    if(response.status===401&&!identity)globalThis.dispatchEvent?.(new Event('technovalens-auth-required'));
+    return response;
   }
   return { client, workspaceFetch };
 }
@@ -40,3 +48,7 @@ catch (error) { configurationError = error; baseURL = '/api'; }
 const workspaceApi = createWorkspaceApi({ baseURL, configurationError });
 export const api = workspaceApi.client;
 export const apiFetch = workspaceApi.workspaceFetch;
+api.interceptors.response.use(response=>response,error=>{
+  if(error.response?.status===401&&error.response?.data?.code==='AUTH_REQUIRED')globalThis.dispatchEvent?.(new Event('technovalens-auth-required'));
+  return Promise.reject(error);
+});

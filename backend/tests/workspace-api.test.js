@@ -32,11 +32,11 @@ test('real frontend client uploads under Node watch dependency reporting, refres
     }
     assert.ok(ready,'isolated backend must start');
     const health = await (await fetch(`${base}/api/health`)).json();
-    assert.deepEqual(health.workspaceAuth,{version:1,header:'X-Workspace-Token'});
+    assert.deepEqual(health.workspaceAuth,{version:2,method:'session-cookie'});
     const form = () => { const body=new FormData();body.append('file',new Blob(['Name,Score\nA,80\nB,100\n']),'scores.csv');return body; };
     for (const token of [undefined,'invalid','A'.repeat(64)]) {
       const rejected = await fetch(`${base}/api/files/upload`,{method:'POST',body:form(),headers:token?{'X-Workspace-Token':token}:{}});
-      assert.equal(rejected.status,401);assert.equal((await rejected.json()).code,'WORKSPACE_TOKEN_REQUIRED');
+      assert.equal(rejected.status,401);assert.equal((await rejected.json()).code,'AUTH_REQUIRED');
       assert.equal(rejected.headers.get('cache-control'),'no-store');
     }
     assert.deepEqual(await readdir(path.join(directory,'uploads')),[],'unauthorized uploads cannot be stored');
