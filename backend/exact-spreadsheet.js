@@ -7,6 +7,9 @@ const format=value=>value==null?'not available':new Intl.NumberFormat('en',{maxi
 const validDate=value=>/^\d{4}-\d\d-\d\d$/.test(value)&&Number.isFinite(Date.parse(value))&&new Date(value).toISOString().slice(0,10)===value;
 const clarify=message=>({answer:`Please specify ${message}`,clarification:true,source:'local-spreadsheet',references:[]});
 const letter=index=>{let result='';for(let n=index+1;n;n=Math.floor((n-1)/26))result=String.fromCharCode(65+(n-1)%26)+result;return result;};
+const orderIdColumns=sheet=>sheet.columns.filter(column=>normalize(column)==='order id');
+const orderCount=/\b(?:(?:how many|number of|count(?: of)?|total)\s+(?:(?:unique|distinct)\s+)?orders?|order count)\b/i;
+const lookupIntent=/\border[\s_-]*id\s*(?:(?:equals?|is)\s+|[=:]\s*|["']|[\p{L}\p{N}])/iu;
 
 export function resolveWorksheetScope(sheets,question,selectedSheet=null) {
   if(selectedSheet!=null&&(typeof selectedSheet!=='string'||!sheets.some(sheet=>sheet.name===selectedSheet)))return clarify('an existing selected worksheet. The selection is stale or invalid.');
@@ -27,14 +30,15 @@ export function resolveWorksheetScope(sheets,question,selectedSheet=null) {
 
 export function planSpreadsheetQuestion(sheets,question,{selectedSheet=null}={}) {
   const q=String(question).trim();
-  const requestedAggregations=[/\b(sum|total|combined)\b/i,/\b(average|avg|mean)\b/i,/\b(highest|maximum|max|largest)\b/i,/\b(lowest|minimum|min|smallest)\b/i].filter(pattern=>pattern.test(q));
-  if(requestedAggregations.length>1)return clarify('one calculation per question (sum, average, minimum or maximum).');
+  const requestedAggregations=[['sum',/\b(sum|total|combined)\b/i],['average',/\b(average|avg|mean)\b/i],['max',/\b(highest|maximum|max|largest)\b/i],['min',/\b(lowest|minimum|min|smallest)\b/i]].filter(([,pattern])=>pattern.test(q)).map(([operation])=>operation);
+  const minmax=requestedAggregations.length===2&&requestedAggregations.includes('min')&&requestedAggregations.includes('max');
+  if(requestedAggregations.length>1&&!minmax)return clarify('one calculation per question (sum, average, minimum or maximum), or minimum and maximum together.');
   if(/\b(percent(?:age)?|ratio|median|difference|growth|weighted)\b|\bnet total\b/i.test(q))return clarify('the exact calculation and its columns. Ratios, changes and compound expressions are not inferred; ask for each supported aggregate separately.');
-  let operation=/\b(how many|number of|count(?: of)?)\s+(?:work)?sheets?\b/i.test(q)?'sheets':/\b(how many|number of|list|which)\b.*\b(columns?|fields?)\b/i.test(q)?'columns':/\b(unique|distinct)\b/i.test(q)?'distinct':
+  let operation=minmax?'minmax':/\b(how many|number of|count(?: of)?)\s+(?:work)?sheets?\b/i.test(q)?'sheets':/\b(how many|number of|list|which)\b.*\b(columns?|fields?)\b/i.test(q)?'columns':orderCount.test(q)?'orders':/\b(unique|distinct)\b/i.test(q)?'distinct':
     /\b(duplicate|duplicated)\b/i.test(q)?'duplicates':/\b(missing|null|blank|empty)\b/i.test(q)&&!/(where|with|only).*\b(missing|null|blank|empty)\b/i.test(q)?'missing':
-    /\b(how many|number of|count(?: of)?)\b.*\b(rows?|records?)\b|\b(row|record) count\b/i.test(q)?'count':
+    /\b(how many|number of|count(?: of)?|total)\b.*\b(rows?|records?)\b|\b(row|record) count\b/i.test(q)?'count':
     /\b(average|avg|mean)\b/i.test(q)?'average':/\b(highest|maximum|max|largest|most)\b/i.test(q)?'max':/\b(lowest|minimum|min|smallest|least)\b/i.test(q)?'min':
-    /\b(sum|total|combined)\b/i.test(q)?'sum':/\b(trend|monthly|over time|growth)\b/i.test(q)?'trend':/\b(summary|summarize|summarise|overview|key metrics)\b/i.test(q)?'summary':null;
+    /\b(sum|total|combined)\b/i.test(q)?'sum':/\b(trend|monthly|over time|growth)\b/i.test(q)?'trend':lookupIntent.test(q)?'lookup':/\b(summary|summarize|summarise|overview|key metrics)\b/i.test(q)?'summary':null;
   if(/\b(recommend|recommendations|interpret|explain|insights|comprehensive|full analysis)\b/i.test(q)&&!operation)return null;
   if(!operation)return null;
   if(operation==='sheets')return {answer:`There are ${sheets.length} worksheets: ${sheets.map(s=>s.name).join(', ')}.`,source:'local-spreadsheet',references:[]};
@@ -96,7 +100,28 @@ function filterRows(sheet,question){
 }
 
 export function answerSheetQuestion(sheet,plan){
-  const {operation,question}=plan,q=question.split(/\bwhere\b|\bwith\b|\bonly\b/i)[0];
+  const {operation}=plan;
+  // Resolve scope before interpreting filters: a worksheet suffix is not a cell value.
+  const question=plan.question.replace(/[?!.]+$/,'').replace(new RegExp(`\\s+(?:in|from|on|for)\\s+(?:the\\s+)?["']?${escape(sheet.name.trim())}["']?(?:\\s+(?:worksheet|sheet))?$`,'i'),'');
+  const q=question.split(/\bwhere\b|\bwith\b|\bonly\b/i)[0];
+  if(operation==='minmax'){
+    const results=['min','max'].map(operation=>answerSheetQuestion(sheet,{...plan,operation}));
+    const error=results.find(result=>result.clarification);if(error)return error;
+    return {answer:results.map(result=>result.answer).join('\n\n'),source:'local-spreadsheet',references:results[0].references,
+      calculation:{operation,worksheet:sheet.name,min:results[0].calculation,max:results[1].calculation}};
+  }
+  if(operation==='lookup'){
+    const columns=orderIdColumns(sheet);
+    if(columns.length!==1)return clarify(`one verified Order ID column in "${sheet.name}".`);
+    const match=question.match(new RegExp(`${escape(columns[0])}\\s*(?:(?:equals?|is)\\s+|[=:]\\s*)?(?:"([^"]+)"|'([^']+)'|([^\\s"']+))$`,'i'));
+    if(!match)return clarify('one exact Order ID, for example Order ID = "ORD-1001", and a worksheet.');
+    const value=match[1]??match[2]??match[3];
+    const indices=[];sheet.rows.forEach((row,index)=>{if(!isBlank(row[columns[0]])&&String(row[columns[0]]).trim()===value)indices.push(index);});
+    const reference=source(sheet,indices,sheet.columns);
+    const rows=indices.slice(0,30).map(index=>({row:sheet.sourceRows?.[index]??index+1,values:sheet.rows[index]}));
+    const answer=indices.length?`${indices.length} matching records for ${columns[0]} "${value}" in ${sheet.name}:\n${rows.map(row=>`${reference.rowKind==='excel'?'Excel':'Normalized data'} row ${row.row}: ${sheet.columns.map(column=>`${column}: ${String(row.values[column]??'(blank)')}`).join('; ')}`).join('\n')}${indices.length>rows.length?`\nShowing ${rows.length} of ${indices.length} matches; all stored rows were searched.`:''}`:`No records match ${columns[0]} "${value}" in ${sheet.name}. All ${sheet.rows.length} stored rows were searched.`;
+    return {answer:`${answer}\n\n${referenceText(reference)}`,source:'local-spreadsheet',references:[reference],calculation:{operation,worksheet:sheet.name,column:columns[0],lookupValue:value,matchedRows:indices.length,rows}};
+  }
   const {indices,conditions,error}=filterRows(sheet,question);if(error)return error;
   const selected=indices.map(index=>sheet.rows[index]);
   const byClause=question.match(/\bby\s+(.+?)(?=\s+where\s+|$)/i);
@@ -116,6 +141,24 @@ export function answerSheetQuestion(sheet,plan){
   else if(operation==='distinct'){
     const columns=sheet.columns.filter(c=>contains(q,c));if(columns.length!==1)return clarify('the column whose distinct values should be counted.');
     const value=new Set(selected.map(row=>row[columns[0]]).filter(v=>!isBlank(v)).map(String)).size;calculation={...calculation,column:columns[0],value};answer=`There are ${value} distinct nonblank values in ${columns[0]} in ${sheet.name}.`;
+  }
+  else if(operation==='orders'){
+    const columns=orderIdColumns(sheet);
+    if(columns.length!==1)return clarify(`one verified Order ID column in "${sheet.name}" to count orders. There are ${indices.length} data rows; the number of orders cannot be verified from row count alone.`);
+    const column=columns[0],distinct=/\b(unique|distinct)\b/i.test(q);
+    const count=rows=>{const ids=rows.map(row=>row[column]).filter(value=>!isBlank(value)).map(value=>String(value).trim());return {totalRows:rows.length,nonemptyOrderIds:ids.length,distinctOrders:new Set(ids).size,missingOrderIds:rows.length-ids.length,duplicateOrderIds:ids.length-new Set(ids).size};};
+    const counts=count(selected),value=distinct?counts.distinctOrders:counts.nonemptyOrderIds;
+    reference.columns.push({name:column,letter:letter(sheet.columns.indexOf(column))});
+    calculation={...calculation,column,value,...counts};
+    answer=`There are ${value} ${distinct?'distinct orders':'nonempty Order IDs'} in ${sheet.name}: ${counts.totalRows} total data rows, ${counts.distinctOrders} distinct orders, ${counts.duplicateOrderIds} repeated Order IDs, and ${counts.missingOrderIds} rows without an Order ID.`;
+    if(!counts.duplicateOrderIds&&!counts.missingOrderIds)answer+=` Each row has a unique Order ID: ${value} orders.`;
+    if(groupedColumn){
+      const groups=new Map();for(const row of selected){const key=isBlank(row[groupedColumn])?'(blank)':String(row[groupedColumn]);if(!groups.has(key))groups.set(key,[]);groups.get(key).push(row);}
+      const data=[...groups].map(([name,rows])=>{const counts=count(rows);return {name,value:distinct?counts.distinctOrders:counts.nonemptyOrderIds,...counts};});
+      calculation={...calculation,groupColumn:groupedColumn,data};
+      answer+=` Counts by ${groupedColumn}: ${data.slice(0,30).map(group=>`${group.name}: ${group.value} (${group.distinctOrders} distinct orders, ${group.totalRows} rows)`).join('; ')}.${data.length>30?` Showing 30 of ${data.length} groups.`:''}`;
+      reference.columns.push({name:groupedColumn,letter:letter(sheet.columns.indexOf(groupedColumn))});
+    }
   }
   else if(operation==='count'){
     if(groupedColumn){const groups=new Map();for(const row of selected){const key=isBlank(row[groupedColumn])?'(blank)':String(row[groupedColumn]);groups.set(key,(groups.get(key)||0)+1);}const data=[...groups].map(([name,value])=>({name,value}));calculation={...calculation,groupColumn:groupedColumn,data};answer=`Record counts by ${groupedColumn} in ${sheet.name}: ${data.slice(0,30).map(g=>`${g.name}: ${g.value}`).join('; ')}.${data.length>30?` Showing 30 of ${data.length} groups; narrow the filter for others.`:''}`;}

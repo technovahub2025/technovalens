@@ -11,6 +11,72 @@ const sheet={name:'Sales',columns:['Region','Revenue','Date'],sourceRows:[3,4,7,
 ]};
 const ask=q=>answerSheetQuestion(sheet,planSpreadsheetQuestion([sheet],q));
 
+const orders={name:'Sales',columns:['Order ID','Amount','Region'],sourceRows:[3,4,7,8,9],rows:[
+  {'Order ID':'ORD-001',Amount:10,Region:'North'},
+  {'Order ID':'ORD-002',Amount:20,Region:'South'},
+  {'Order ID':'ORD-001',Amount:30,Region:'North'},
+  {'Order ID':null,Amount:40,Region:'North'},
+  {'Order ID':'ORD-0010',Amount:50,Region:'South'}
+]};
+const orderQuestions=['How many orders are there in Sales?','number of orders in Sales','count orders in Sales','total orders in Sales'];
+const askOrders=(question,data=orders)=>{
+  const plan=planSpreadsheetQuestion([data,{...sheet,name:'Inventory'}],question,{selectedSheet:'Inventory'});
+  assert.deepEqual(plan.sheetNames,['Sales']);
+  return answerSheetQuestion(data,plan);
+};
+
+test('order count synonyms resolve the named sheet and distinguish rows, nonempty IDs and distinct orders',()=>{
+  for(const question of orderQuestions){
+    const result=askOrders(question);
+    assert.equal(result.calculation.value,4,question);
+    assert.equal(result.calculation.totalRows,5);
+    assert.equal(result.calculation.distinctOrders,3);
+    assert.equal(result.calculation.missingOrderIds,1);
+    assert.equal(result.calculation.duplicateOrderIds,1);
+    assert.match(result.answer,/5 total data rows, 3 distinct orders/);
+    assert.equal(result.references[0].columns[0].name,'Order ID');
+    assert.deepEqual(result.references[0].ranges,[[3,4],[7,9]]);
+  }
+  for(const phrase of ['how many records','number of rows','count rows','total records'])assert.equal(askOrders(`${phrase} in Sales?`).calculation.value,5);
+  for(const phrase of ['how many distinct orders','number of unique orders','count distinct orders','total unique orders'])assert.equal(askOrders(`${phrase} in Sales`).calculation.value,3);
+});
+
+test('order counts do not require numeric columns, infer no unverified order key and retain filters/groups',()=>{
+  const textOnly={...orders,columns:['Order ID'],rows:[{'Order ID':'A'},{'Order ID':'B'}],sourceRows:[2,3]};
+  for(const question of orderQuestions){const result=askOrders(question,textOnly);assert.equal(result.calculation.value,2);assert.match(result.answer,/2 orders/);}
+  for(const data of [sheet,{...orders,columns:['Customer ID','Amount']},{...orders,columns:['Order ID','Order_ID']}])assert.equal(askOrders(orderQuestions[0],data).clarification,true);
+  assert.equal(askOrders('count orders where Region = North in Sales').calculation.value,2);
+  assert.deepEqual(askOrders('count orders by Region in Sales').calculation.data.map(group=>group.value),[2,2]);
+  const empty=askOrders('total orders in Sales',{...textOnly,rows:[],sourceRows:[]});assert.equal(empty.calculation.value,0);
+});
+
+test('minimum and maximum share the exact metric and filters, including grouping and monthly aggregates',()=>{
+  for(const phrase of ['min and max','minimum and maximum','lowest and highest']){
+    const result=askOrders(`${phrase} Amount in Sales`);
+    assert.equal(result.calculation.min.value,10);assert.equal(result.calculation.max.value,50);
+    assert.equal(result.references[0].columns[0].name,'Amount');
+  }
+  const filtered=askOrders('min and max Amount where Region = North in Sales');
+  assert.equal(filtered.calculation.min.value,10);assert.equal(filtered.calculation.max.value,40);
+  const grouped=askOrders('min and max Amount by Region in Sales');assert.deepEqual(grouped.calculation.max.data.map(group=>group.value),[40,50]);
+  const monthly=ask('min and max Revenue by month');assert.deepEqual(monthly.calculation.min.data.map(item=>item.value),[100,50]);
+  for(const question of ['What is average value?','min and max Profit in Sales'])assert.equal(askOrders(question.includes('Sales')?question:`${question.replace('?','')} in Sales`).clarification,true);
+});
+
+test('exact Order ID lookup returns all matching rows and verified physical references without substring matches',()=>{
+  for(const phrase of ['Show Order ID ORD-001','Find Order ID = "ORD-001"',"Look up Order ID equals 'ORD-001'",'What is Amount for Order ID ORD-001']){
+    const result=askOrders(`${phrase} in Sales?`);
+    assert.equal(result.calculation.matchedRows,2,phrase);
+    assert.deepEqual(result.calculation.rows.map(row=>row.row),[3,7]);
+    assert.deepEqual(result.references[0].ranges,[[3,3],[7,7]]);
+    assert.match(result.answer,/Excel row 7/);
+  }
+  assert.equal(askOrders('Find Order ID ORD-00 in Sales').calculation.matchedRows,0);
+  assert.equal(askOrders('Find Order ID ord-001 in Sales').calculation.matchedRows,0);
+  assert.equal(askOrders('Find Order ID in Sales').clarification,true);
+  const normalized=askOrders('Find Order ID ORD-001 in Sales',{...orders,sourceRows:undefined});assert.equal(normalized.references[0].rowKind,'normalized');assert.doesNotMatch(normalized.answer,/Excel row/);
+});
+
 test('current worksheet references use explicit selection for all sample and Eveready worksheet names',()=>{
   for(const names of [['Sales','Employees','Inventory','Expenses'],['PURLIN','CNC','PTW & HAND SETTING','DRILLING & PUNCHING','STIFFENER ','SETTING','WELDING','LATHE','CLEANING','PAINTING','DISPACHED']]){
     const sheets=names.map(name=>({...sheet,name}));
