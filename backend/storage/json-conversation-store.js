@@ -1,7 +1,5 @@
 
 import crypto from "crypto";
-import fs from "fs";
-import path from "path";
 import { getDB } from "../config/db.js";
 
 const ANSWER_SOURCES = new Set([
@@ -20,50 +18,17 @@ export class JsonConversationStore {
     this.collection = null;
   }
 
-  async initialize() {
+  async initialize({readOnly=false}={}) {
     const db = getDB();
     this.collection = db.collection(this.collectionName);
+    if(readOnly)return;
 
     await this.collection.createIndex({ fileId: 1 });
+    await this.collection.createIndex({ ownerHash: 1, updatedAt: -1 });
     await this.collection.createIndex({ updatedAt: -1 });
 
-    // Migrate existing conversations.json records into MongoDB.
-    // Existing records are preserved and duplicate IDs are not inserted twice.
-    const filePath = path.join(this.directory, "conversations.json");
-
-    try {
-      const persisted = JSON.parse(
-        fs.readFileSync(filePath, "utf8")
-      );
-
-      if (Array.isArray(persisted)) {
-        for (const conversation of persisted) {
-          if (
-            typeof conversation.id === "string" &&
-            typeof conversation.fileId === "string" &&
-            Array.isArray(conversation.messages)
-          ) {
-            await this.collection.updateOne(
-              { _id: conversation.id },
-              {
-                $setOnInsert: {
-                  ...conversation,
-                  _id: conversation.id
-                }
-              },
-              { upsert: true }
-            );
-          }
-        }
-      }
-
-      console.log("Existing conversations migration checked.");
-    } catch (error) {
-      if (error?.code !== "ENOENT") {
-        console.warn("Conversation migration warning:", error.message);
-      }
-    }
-
+    // Historical imports are handled by audit-storage.mjs after ownership and
+    // integrity verification; startup never merges or invents history.
     console.log("MongoDB conversation store initialized.");
   }
 
@@ -75,12 +40,13 @@ export class JsonConversationStore {
     return this.collection;
   }
 
-  async create(fileId, title) {
+  async create(fileId, title, ownerHash) {
     const now = new Date().toISOString();
 
     const conversation = {
       id: crypto.randomUUID(),
       fileId,
+      ...(ownerHash ? { ownerHash } : {}),
       title: String(title || "Conversation").slice(0, 200),
       createdAt: now,
       updatedAt: now,
@@ -96,31 +62,33 @@ export class JsonConversationStore {
   }
 
   async get(id) {
+    if(typeof id!=='string'||!id)return null;
     const conversation = await this.getCollection().findOne({
-      _id: id
+      $or: [{ _id: id }, { id }]
     });
 
     if (!conversation) return null;
 
     const { _id, ...result } = conversation;
-    return result;
+    return { ...result, id: result.id || String(_id) };
   }
 
-  async list() {
+  async list(ownerHash) {
     const conversations = await this.getCollection()
-      .find({})
+      .find(ownerHash ? { ownerHash } : {})
       .sort({ updatedAt: -1 })
       .toArray();
 
     return conversations.map((conversation) => ({
-      id: conversation.id,
+      id: conversation.id || String(conversation._id),
+      ownerHash: conversation.ownerHash,
       fileId: conversation.fileId,
       title: conversation.title,
       createdAt: conversation.createdAt,
       updatedAt: conversation.updatedAt,
-      messageCount: conversation.messages.length,
+      messageCount: (conversation.messages || []).length,
       lastMessage:
-        conversation.messages.at(-1)?.text?.slice(0, 180) || ""
+        conversation.messages?.at(-1)?.text?.slice(0, 180) || ""
     }));
   }
 
@@ -149,6 +117,7 @@ export class JsonConversationStore {
         ? {
             retryRequest: {
               fileId: conversation.fileId,
+              selectedSheet: typeof input.retryRequest.selectedSheet === 'string' ? input.retryRequest.selectedSheet : null,
               question: input.retryRequest.question.slice(0, 4000),
               retryCount: Math.max(
                 0,
@@ -164,7 +133,7 @@ export class JsonConversationStore {
 
     const result = await collection.updateOne(
       {
-        _id: id,
+        $or: [{ _id: id }, { id }],
         updatedAt: conversation.updatedAt
       },
       {
@@ -184,7 +153,7 @@ export class JsonConversationStore {
 
   async delete(id) {
     const result = await this.getCollection().deleteOne({
-      _id: id
+      $or: [{ _id: id }, { id }]
     });
 
     return result.deletedCount > 0;
@@ -194,5 +163,8 @@ export class JsonConversationStore {
     await this.getCollection().deleteMany({
       fileId
     });
+  }
+  async assignOwner(id, ownerHash) {
+    await this.getCollection().updateOne({$or:[{_id:id},{id}],ownerHash:{$exists:false}},{$set:{ownerHash}});
   }
 }

@@ -12,6 +12,7 @@ import {
   Tooltip, XAxis, YAxis
 } from "recharts";
 import AnalyticsReports from "./AnalyticsReports.jsx";
+import { loadConversation, initialPage } from './conversation-client.js';
 import { validateFileMetadata, validateUpload, fileDimensions } from "./api-contracts.js";
 
 // =====================================================
@@ -127,7 +128,6 @@ const nav = [
   ["Dashboard", LayoutDashboard],
   ["Excel Files", Files],
   ["AI Excel Chat", MessageSquareText],
-  ["Analytics", BarChart3],
   ["Reports", Activity]
 ];
 
@@ -136,10 +136,25 @@ const nav = [
 // =====================================================
 
 export default function App() {
-  const [active, setActive] = useState("Dashboard");
+  const [active, setActive] = useState(()=>initialPage(window.location));
+  useEffect(()=>{
+    const routes={'Dashboard':'dashboard','Excel Files':'files','AI Excel Chat':'chat','Reports':'reports'};
+    if(routes[active])window.history.replaceState(null,'',`${window.location.pathname}${window.location.search}#${routes[active]}`);
+  },[active]);
+  useEffect(()=>{const navigate=()=>{
+    const page=initialPage(window.location);
+    if(page==='Reports'&&/^#\/?analytics\/?$/i.test(window.location.hash))window.history.replaceState(null,'',`${window.location.pathname}${window.location.search}#reports`);
+    setActive(page);
+  };window.addEventListener('hashchange',navigate);return()=>window.removeEventListener('hashchange',navigate);},[]);
 
   const [file, setFile] = useState(null);
   const [fileInfo, setFileInfo] = useState(null);
+  const [chatWorksheets,setChatWorksheets]=useState(()=>{try{const stored=JSON.parse(localStorage.getItem('technovalens.chatWorksheets')||'{}');return stored&&typeof stored==='object'&&!Array.isArray(stored)?stored:{};}catch{return {};}});
+  const savedSheet=fileInfo&&Object.prototype.hasOwnProperty.call(chatWorksheets,fileInfo.fileId)?chatWorksheets[fileInfo.fileId]:fileInfo?.sheetName;
+  const selectedSheet=fileInfo?.kind==='spreadsheet'&&fileInfo.sheetNames?.includes(savedSheet)?savedSheet:null;
+  function selectChatWorksheet(name){
+    setChatWorksheets(previous=>{const next={...previous,[fileInfo.fileId]:name||null};try{localStorage.setItem('technovalens.chatWorksheets',JSON.stringify(next));}catch{}return next;});
+  }
   const [preview, setPreview] = useState([]);
 
   const [question, setQuestion] = useState("");
@@ -172,6 +187,7 @@ export default function App() {
   const inputRef = useRef(null);
   const busyRef = useRef(false);
   const uploadControllerRef = useRef(null);
+  const chatControllerRef = useRef(null);
   const openSequenceRef = useRef(0);
 
   const columns = useMemo(
@@ -212,27 +228,26 @@ export default function App() {
 
   async function restoreConversation(conversation, options = {}) {
     if (!conversation?.id) return;
+    if(uploadControllerRef.current){setNotice('Finish or cancel the upload before switching conversations.');return;}
 
     const sequence = ++openSequenceRef.current;
-
+    chatControllerRef.current?.abort();
+    busyRef.current=false;setBusy(false);setProcessStage('');
+    setCurrentConversationId(null);setFileInfo(null);setPreview([]);setMessages([]);setFile(null);setQuestion('');
     setLoadingConversation(true);
     setNotice("");
+    setActive(options.active || 'AI Excel Chat');
 
     try {
-      const [chatResponse, fileResponse] = await Promise.all([
-        api.get(`/conversations/${conversation.id}`),
-        api.get(`/files/${conversation.fileId}`)
-      ]);
+      const {chat,document,recoveryMessage}=await loadConversation(api,conversation.id);
 
       if (sequence !== openSequenceRef.current) return;
 
-      const chat = chatResponse.data;
-      const document = fileResponse.data;
-
       setCurrentConversationId(chat.id);
-      setFileInfo(validateFileMetadata(document));
+      setFileInfo(document);
       setFile(null);
-      setPreview(Array.isArray(document.preview) ? document.preview : []);
+      setPreview(Array.isArray(document?.preview) ? document.preview : []);
+      if(recoveryMessage)setNotice(recoveryMessage);
 
       const restoredMessages = Array.isArray(chat.messages)
         ? chat.messages.map(message => ({
@@ -241,16 +256,7 @@ export default function App() {
           }))
         : [];
 
-      setMessages(
-        restoredMessages.length
-          ? restoredMessages
-          : [
-              {
-                role: "assistant",
-                text: `Continue asking questions about ${safeText(document.fileName, "your file")}.`
-              }
-            ]
-      );
+      setMessages(restoredMessages);
 
       setActive(options.active || "AI Excel Chat");
 
@@ -345,26 +351,7 @@ export default function App() {
           // Browser storage may be disabled.
         }
 
-        const selected =
-          chats.find(item => item.id === selectedId) || chats[0];
-
-        if (selected) {
-          await restoreConversation(selected);
-        } else if (files[0]) {
-          const detailResponse = await api.get(
-            `/files/${files[0].fileId}`
-          );
-
-          if (!cancelled) {
-            setFileInfo(validateFileMetadata(detailResponse.data));
-            setPreview(
-              Array.isArray(detailResponse.data.preview)
-                ? detailResponse.data.preview
-                : []
-            );
-            setActive("Excel Files");
-          }
-        }
+        if(selectedId)await restoreConversation({id:selectedId},{active:initialPage(window.location)});
 
       } catch (error) {
         if (!cancelled) {
@@ -386,6 +373,7 @@ export default function App() {
 
     return () => {
       cancelled = true;
+      chatControllerRef.current?.abort();
       openSequenceRef.current++;
     };
   }, []);
@@ -584,6 +572,11 @@ export default function App() {
       );
       return;
     }
+    if(requestFileId!==fileInfo?.fileId||!currentConversationId){setNotice('Reopen the original conversation before retrying this question.');return;}
+    const requestConversationId=currentConversationId,requestSequence=openSequenceRef.current;
+    const requestSelectedSheet=retryRequest?(retryRequest.selectedSheet??null):selectedSheet;
+    const controller=new AbortController();chatControllerRef.current=controller;
+    const stillSelected=()=>openSequenceRef.current===requestSequence&&!controller.signal.aborted;
 
     if (!retryRequest) {
       setMessages(current => [
@@ -608,11 +601,11 @@ export default function App() {
 
       if (!retryRequest) {
         await api.post(
-          `/conversations/${currentConversationId}/messages`,
+          `/conversations/${requestConversationId}/messages`,
           {
             role: "user",
-            text: q
-          }
+            text: q,fileId:requestFileId
+          },{signal:controller.signal}
         );
       }
 
@@ -631,12 +624,15 @@ export default function App() {
           `/ai/ask/progress`,
           {
             method: "POST",
+            signal:controller.signal,
             headers: {
               "Content-Type": "application/json",
               Accept: "text/event-stream"
             },
             body: JSON.stringify({
               fileId: requestFileId,
+              conversationId:requestConversationId,
+              selectedSheet:requestSelectedSheet,
               question: q
             })
           }
@@ -698,7 +694,7 @@ export default function App() {
 
               const payload = JSON.parse(payloadText);
 
-              if (eventName === "progress") {
+              if (eventName === "progress" && stillSelected()) {
                 setProcessStage(
                   safeText(payload.stage, "Analysing document")
                 );
@@ -743,6 +739,7 @@ export default function App() {
         }
 
       } catch (progressError) {
+        if(!stillSelected())return;
         if (
           progressError.analysisFailed ||
           progressError.backendFailure
@@ -759,6 +756,7 @@ export default function App() {
       // -----------------------------------------------
 
       if (useJsonFallback) {
+        if(!stillSelected())return;
         setProcessStage("Analysing document");
 
         try {
@@ -766,8 +764,10 @@ export default function App() {
             `/ai/ask`,
             {
               fileId: requestFileId,
+              conversationId:requestConversationId,
+              selectedSheet:requestSelectedSheet,
               question: q
-            }
+            },{signal:controller.signal}
           );
 
           answer = safeText(
@@ -797,10 +797,12 @@ export default function App() {
       // SAVE ANSWER
       // -----------------------------------------------
 
+      if(!stillSelected())return;
       setProcessStage("Completed");
 
       const answerMessage = {
         role: "assistant",
+        fileId:requestFileId,
         text: safeText(answer, "I couldn't produce an answer."),
         source: answerSource,
         cached: answerCached,
@@ -809,6 +811,7 @@ export default function App() {
           ? {
               retryRequest: {
                 fileId: requestFileId,
+                selectedSheet:requestSelectedSheet,
                 question: q,
                 retryCount:
                   (retryRequest?.retryCount || 0) +
@@ -824,10 +827,10 @@ export default function App() {
       ]);
 
       await api.post(
-        `/conversations/${currentConversationId}/messages`,
-        answerMessage
+        `/conversations/${requestConversationId}/messages`,
+        answerMessage,{signal:controller.signal}
       ).catch(() => {
-        setNotice(
+        if(stillSelected())setNotice(
           "Answer is shown, but could not be saved to conversation history."
         );
       });
@@ -835,6 +838,7 @@ export default function App() {
       refreshPersistentLists().catch(() => {});
 
     } catch (error) {
+      if(!stillSelected())return;
       setProcessStage("");
       setQuestion(q);
 
@@ -847,6 +851,7 @@ export default function App() {
 
         retryRequest: {
           fileId: requestFileId,
+          selectedSheet:requestSelectedSheet,
           question: q,
           retryCount: retryRequest
             ? (retryRequest.retryCount || 0) + 1
@@ -861,14 +866,14 @@ export default function App() {
 
       if (currentConversationId) {
         api.post(
-          `/conversations/${currentConversationId}/messages`,
-          errorMessage
+          `/conversations/${requestConversationId}/messages`,
+          {...errorMessage,fileId:requestFileId}
         ).catch(() => {});
       }
 
     } finally {
-      busyRef.current = false;
-      setBusy(false);
+      if(openSequenceRef.current===requestSequence){busyRef.current=false;setBusy(false);}
+      if(chatControllerRef.current===controller)chatControllerRef.current=null;
     }
   }
 
@@ -969,6 +974,7 @@ export default function App() {
                 active === label ? "active" : ""
               }`}
               onClick={() => setActive(label)}
+              aria-label={label}
             >
               <Icon size={18} />
               <span>{label}</span>
@@ -1051,6 +1057,12 @@ export default function App() {
         </header>
 
         <div className="page">
+          <label className="mobile-conversations">Conversation
+            <select aria-label="Saved conversation" value={currentConversationId||''} disabled={loadingConversation||Boolean(uploadControllerRef.current)} onChange={event=>{if(event.target.value)restoreConversation({id:event.target.value});}}>
+              <option value="">Choose saved conversation</option>
+              {conversations.map(chat=><option key={chat.id} value={chat.id}>{safeText(chat.title,'Conversation')}</option>)}
+            </select>
+          </label>
 
           {/* WELCOME */}
 
@@ -1235,11 +1247,11 @@ export default function App() {
                     value={question}
                     onChange={e => setQuestion(e.target.value)}
                     placeholder="Ask anything about your file..."
-                    disabled={busy || loadingConversation}
+                    disabled={busy || loadingConversation || !fileInfo || !currentConversationId}
                   />
 
                   <button
-                    disabled={busy || loadingConversation}
+                    disabled={busy || loadingConversation || !fileInfo || !currentConversationId}
                   >
                     <Send size={17} />
                   </button>
@@ -1289,11 +1301,12 @@ export default function App() {
                       <>
                         <div className="side-divider" />
 
-                        <small>AVAILABLE SHEETS</small>
-
-                        <div className="sheet-name">
-                          {safeText(fileInfo.sheetName, "Sheet 1")}
-                        </div>
+                        <label className="chat-worksheet">Selected worksheet
+                          <select aria-label="Chat worksheet" value={selectedSheet||''} disabled={busy||loadingConversation} onChange={event=>selectChatWorksheet(event.target.value)}>
+                            <option value="">Choose a worksheet</option>
+                            {(fileInfo.sheetNames||[]).map(name=><option key={name} value={name}>{name}</option>)}
+                          </select>
+                        </label>
                       </>
                     )}
 
@@ -1665,7 +1678,7 @@ export default function App() {
                           tickLine={false}
                           tick={{
                             fill: "#9691A5",
-                            fontSize: 12
+                            fontSize: 13
                           }}
                         />
 
@@ -1674,7 +1687,7 @@ export default function App() {
                           tickLine={false}
                           tick={{
                             fill: "#9691A5",
-                            fontSize: 12
+                            fontSize: 13
                           }}
                         />
 
@@ -1739,14 +1752,14 @@ export default function App() {
 
                   </button>
 
-                  <button onClick={() => setActive("Analytics")}>
+                  <button onClick={() => setActive("Reports")}>
 
                     <div className="quick-icon">
                       <TrendingUp />
                     </div>
 
                     <div>
-                      <b>View analytics</b>
+                      <b>View reports</b>
                       <small>Explore data insights</small>
                     </div>
 
@@ -1835,7 +1848,7 @@ export default function App() {
 
             </>
 
-          ) : active === "Analytics" || active === "Reports" ? (
+          ) : active === "Reports" ? (
 
             <AnalyticsReports
               page={active}

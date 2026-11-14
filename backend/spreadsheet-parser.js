@@ -132,9 +132,11 @@ if(!isMainThread){
     if(workerData.task){
       const {mode,sheet,filename,options,document,exportPath}=workerData.task;
       const rows=[];for await(const row of readStoredRows(filename,sheet.columns))rows.push(row);
+      if(rows.length!==sheet.rowCount)throw new Error('Stored worksheet is incomplete. Restore the original storage backup before continuing.');
       const loaded={...sheet,rows};
       let taskResult;
       if(mode==='preview')taskResult=previewDataset(loaded,options);
+      else if(mode==='chat'){const {answerSheetQuestion}=await import('./exact-spreadsheet.js');taskResult=answerSheetQuestion(loaded,options.plan);}
       else {
         const stats=analyzeDataset(loaded,options);
         if(mode==='analysis'){const {filteredRows,...summary}=stats;taskResult=summary;}

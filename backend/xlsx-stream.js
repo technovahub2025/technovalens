@@ -80,11 +80,12 @@ export async function streamSpreadsheet(buffer,ext,directory,{onProgress=()=>{},
       if(dateHeading&&typeof sub==='string'&&!blank(sub)&&!/^[-+\d.]+$/.test(sub)&&sub.length<100)values[i]=`${dateHeading} ${sub.trim()}`;
     }
     const columns=headersFor(values,width);
+    const sourceRows=[];
     const filename=`sheet-${manifests.length}.ndjson`, writer=sink(path.join(directory,filename),timings,worksheetIndex);let rowCount=0;
     const lines=createInterface({input:fs.createReadStream(rawFile,{encoding:'utf8'}),crlfDelay:Infinity});
-    try {for await(const line of lines){const row=JSON.parse(line);if(!header||row.number<=header.number)continue;const values=columns.map((_,i)=>row.values[i]??null);if(!row.formulas&&values.every(blank))continue;totalRows++;totalCells+=width;if(totalRows>MAX_ROWS||totalCells>MAX_CELLS)throw limit();writer.write(values);rowCount++;}}
+    try {for await(const line of lines){const row=JSON.parse(line);if(!header||row.number<=header.number)continue;const values=columns.map((_,i)=>row.values[i]??null);if(!row.formulas&&values.every(blank))continue;totalRows++;totalCells+=width;if(totalRows>MAX_ROWS||totalCells>MAX_CELLS)throw limit();writer.write(values);sourceRows.push(row.number);rowCount++;}}
     finally {writer.close();lines.close();fs.rmSync(rawFile,{force:true});finishNormalization();}
-    const manifest={...meta,columns,rowCount,dataFile:filename,headerRow:header?.number||1};manifests.push(manifest);
+    const manifest={...meta,columns,rowCount,sourceRows,dataFile:filename,headerRow:header?.number||1};manifests.push(manifest);
     onProgress({stage:'worksheet-parsed',worksheetIndex:manifests.length,worksheetCount:ext==='csv'?1:undefined,rowCount,columnCount:width});
   }
   if(ext==='csv') {

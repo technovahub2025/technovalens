@@ -52,7 +52,19 @@ try {
       const stats=await json(`/analytics/${file.fileId}?${params}`);validateAnalysis(stats);
       assert.equal(stats.rowCount,meta.rowCount);assert.equal(stats.columnCount,meta.columnCount);
       const expected=await oracle(meta,stats.columns);assert.equal(stats.rowCount,expected.rowCount);
+      for(const question of ['Summarise this sheet','Summarize current sheet','Summary of selected worksheet']){
+        const response=await request('/ai/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fileId:file.fileId,conversationId:file.conversationId,selectedSheet:meta.name,question})});
+        const answer=await response.json();assert.equal(response.status,200);assert.equal(answer.clarification,undefined,JSON.stringify(answer));assert.equal(answer.calculation.worksheet,meta.name);assert.equal(answer.calculation.matchedRows,expected.rowCount);assert.equal(answer.references[0].worksheet,meta.name);
+      }
       if(expected.metric){const actual=stats.columnStats[expected.metric];assert.equal(actual.numericCount,expected.numericCount);assert.ok(Math.abs(actual.sum-expected.sum)<=Math.max(1e-7,Math.abs(expected.sum)*1e-10));}
+      if(expected.metric){
+        for(const [operation,value] of [['total',expected.sum],['average',expected.numericCount?expected.sum/expected.numericCount:null]]){
+          const response=await request('/ai/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fileId:file.fileId,conversationId:file.conversationId,question:`${operation} column "${expected.metric}" in worksheet ${meta.name}`})});
+          const answer=await response.json();assert.equal(response.status,200);assert.equal(answer.source,'local-spreadsheet');assert.ok(answer.calculation,JSON.stringify(answer));
+          if(value===null)assert.equal(answer.calculation.value,null);else assert.ok(Math.abs(answer.calculation.value-value)<=Math.max(1e-7,Math.abs(value)*1e-10),JSON.stringify(answer));
+          assert.equal(answer.references[0].worksheet,meta.name);assert.equal(answer.references[0].rowKind,'excel');
+        }
+      }
       const page=await json(`/analytics/${file.fileId}/preview?${params}&page=2&pageSize=7`);validatePreview(page);assert.ok(page.rows.length<=7);assert.equal(page.total,meta.rowCount);
       if(page.rows.length){const term=String(page.rows[0][stats.columns[0]]??'');if(term){const filtered=await json(`/analytics/${file.fileId}?${params}&search=${encodeURIComponent(term)}`);validateAnalysis(filtered);assert.ok(filtered.rowCount>0&&filtered.rowCount<=stats.rowCount);}}
       if(stats.types.category[0]){const column=stats.types.category[0],category=stats.categories[column][0];const filtered=await json(`/analytics/${file.fileId}?${params}&categoryColumn=${encodeURIComponent(column)}&categoryValue=${encodeURIComponent(category)}`);assert.ok(filtered.rowCount>0&&filtered.rowCount<=stats.rowCount);}

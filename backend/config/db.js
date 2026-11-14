@@ -13,11 +13,11 @@ export async function connectDB() {
     throw new Error("MONGODB_URI is missing from environment variables");
   }
 
-  client = new MongoClient(uri);
+  client = new MongoClient(uri, { serverSelectionTimeoutMS: 15000 });
 
   await client.connect();
 
-  db = client.db("technovalens");
+  db = client.db(process.env.MONGODB_DB_NAME?.trim() || "technovalens");
 
   console.log("MongoDB connected successfully!");
 

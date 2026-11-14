@@ -294,11 +294,12 @@ export function buildCompactSheetContext(sheets, question, maxRows = 30, maxChar
   const requestedSheet = sheets.find(sheet => q.includes(sheet.name.toLocaleLowerCase()));
   const chosen = requestedSheet ? [requestedSheet] : sheets;
   const result = chosen.map(sheet => {
-    const stats = summarizeSheet(sheet);
+    const stored = sheet.analytics || summarizeSheet(sheet);
+    const stats = {sheetName:stored.sheetName,rowCount:stored.rowCount,columnCount:stored.columnCount,duplicateRows:stored.duplicateRows,missingValues:stored.missingValues,columnStats:stored.columnStats,warnings:stored.warnings};
     const terms = q.match(/[\p{L}\p{N}]{3,}/gu) || [];
-    const rankedRows = sheet.rows.map((row, index) => ({ row, index, score: terms.reduce((score, term) => score + (JSON.stringify(row).toLocaleLowerCase().includes(term) ? 1 : 0), 0) }))
+    const rankedRows = (sheet.preview || sheet.rows).map((row, index) => ({ row, index, score: terms.reduce((score, term) => score + (JSON.stringify(row).toLocaleLowerCase().includes(term) ? 1 : 0), 0) }))
       .sort((a, b) => b.score - a.score || a.index - b.index).slice(0, maxRows).sort((a, b) => a.index - b.index).map(item => item.row);
-    return { sheet: sheet.name, statistics: stats, relevantRows: rankedRows };
+    return { sheet: sheet.name, statistics: stats, relevantRows: rankedRows, sampleOnly: Boolean(sheet.preview), formulaWarning: sheet.formulaCount ? `${sheet.uncachedFormulas || 0} formulas lack cached results. Values are cached, never recalculated.` : undefined };
   });
   let context = JSON.stringify(result);
   while (context.length > maxChars && maxRows > 3) {
@@ -306,5 +307,6 @@ export function buildCompactSheetContext(sheets, question, maxRows = 30, maxChar
     for (const item of result) item.relevantRows = item.relevantRows.slice(0, maxRows);
     context = JSON.stringify(result);
   }
-  return { context: context.slice(0, maxChars), sheetKey: requestedSheet?.name || "all-sheets" };
+  if(context.length>maxChars)context=JSON.stringify(result.map(item=>({sheet:item.sheet,rowCount:item.statistics.rowCount,columnCount:item.statistics.columnCount,note:'Detailed statistics exceed context budget. Ask for an explicit worksheet and metric for exact calculations.'})));
+  return { context, sheetKey: requestedSheet?.name || "all-sheets" };
 }

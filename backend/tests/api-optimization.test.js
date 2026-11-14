@@ -160,8 +160,8 @@ async function uploadPdf(base, text = "Quarterly revenue was 125 units and profi
   return response.json();
 }
 
-async function ask(base, fileId, question, route = "/api/ai/ask") {
-  return fetch(`${base}${route}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ fileId, question }) });
+async function ask(base, fileId, question, route = "/api/ai/ask", selectedSheet = null) {
+  return fetch(`${base}${route}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ fileId, question, selectedSheet }) });
 }
 
 async function stopBackend(child) {
@@ -253,14 +253,16 @@ test("Excel API caching, single-flight, 429/503 retries, local answers and persi
     const first = await uploadWorkbook(running.base, [["North", 125], ["South", 90]], [["Costs", costRows]], "https://www.technovahub.in");
     assert.equal(first.sheetNames.length, 2);
 
-    const local = await (await ask(running.base, first.fileId, "What is the total Revenue?")).json();
+    const ambiguous = await (await ask(running.base, first.fileId, "What is the total Revenue?")).json();
+    assert.equal(ambiguous.clarification,true,'multiple worksheets require an explicit choice');
+    const local = await (await ask(running.base, first.fileId, "What is the total Revenue in Sales?")).json();
     assert.equal(local.source, "local-spreadsheet");
     assert.match(local.answer, /215/);
     const otherSheetLocal = await (await ask(running.base, first.fileId, "How many rows are there in Costs?")).json();
     assert.match(otherSheetLocal.answer, /100 data rows in Costs/);
     assert.equal(mock.calls, expectedProviderCalls);
 
-    const aiQuestion = "Explain what the North region data suggests about customer behavior.";
+    const aiQuestion = "Explain what the North region data in Sales suggests about customer behavior.";
     const response1 = await ask(running.base, first.fileId, aiQuestion);
     const result1 = await response1.json();
     assert.equal(response1.status, 200);
@@ -271,11 +273,19 @@ test("Excel API caching, single-flight, 429/503 retries, local answers and persi
     assert.equal(result2.cached, true);
     assert.equal(mock.calls, expectedProviderCalls + 1);
 
-    const structured = await (await ask(running.base, first.fileId, "Provide a comprehensive analysis with recommendations.")).json();
+    const structured = await (await ask(running.base, first.fileId, "Provide a comprehensive analysis of Sales with recommendations.")).json();
     assert.equal(mock.lastMime, "application/json");
     assert.match(structured.answer, /Key insights[\s\S]*Recommendations/);
     expectedProviderCalls++;
     assert.equal(mock.calls, expectedProviderCalls + 1);
+
+    const scopedQuestion='Explain this sheet.';
+    const salesExplanation=await (await ask(running.base,first.fileId,scopedQuestion,'/api/ai/ask','Sales')).json();
+    assert.equal(salesExplanation.cached,false);assert.doesNotMatch(mock.lastPrompt,/ArchiveOnlyRecord/);
+    const costsExplanation=await (await ask(running.base,first.fileId,scopedQuestion,'/api/ai/ask','Costs')).json();
+    assert.equal(costsExplanation.cached,false);assert.match(mock.lastPrompt,/ArchiveOnlyRecord/);
+    assert.equal((await (await ask(running.base,first.fileId,scopedQuestion,'/api/ai/ask','Sales')).json()).cached,true);
+    expectedProviderCalls+=2;
 
     const changed = await uploadWorkbook(running.base, [["North", 200], ["South", 90]]);
     const changedAnswer = await (await ask(running.base, changed.fileId, aiQuestion)).json();
@@ -341,7 +351,7 @@ test("Excel API caching, single-flight, 429/503 retries, local answers and persi
     const usageBeforeRestart = await (await fetch(`${running.base}/api/usage`)).json();
     assert.ok(usageBeforeRestart.dailyRequests > 0);
     assert.equal(usageBeforeRestart.maxConcurrentRequests, 1);
-    assert.equal(usageBeforeRestart.cacheHits, 2);
+    assert.equal(usageBeforeRestart.cacheHits, 3);
     await stopBackend(running.child);
     running = await startBackend({ dataDir, budget: 50 });
     const usageAfterRestart = await (await fetch(`${running.base}/api/usage`)).json();

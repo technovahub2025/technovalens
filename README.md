@@ -92,6 +92,8 @@ An optional `backend/tests/browser-smoke.mjs` checks upload, Recharts, filtering
 
 ### Local upload diagnostics
 
+For ownership-checked backups, snapshot reconciliation and recoverable local cache management, read [storage management](backend/storage-management.md). `npm run audit:storage` in `backend` is read-only by default. Do not use the older broad workspace-assignment helper on mixed-owner historical data. Cache expiration remains disabled until deletion is explicitly approved.
+
 `node --watch` enables Node dependency-reporting messages on worker threads. Spreadsheet parsing uses a typed result message and ignores those notifications; the first worker message is not necessarily a parsed workbook. This prevents a valid workbook from being incorrectly rejected as having no worksheets during `npm run dev`.
 
 Parser logs contain stages, archive byte size, normalization counts, worksheet row/column counts and error codes, without cell values, raw XML, filenames or workspace tokens. Standard Microsoft Excel OOXML bypasses normalization unchanged; only affected prefixed parts are rewritten. Upload/list/detail responses include additive `worksheets: [{ name, rowCount, columnCount }]` metadata, while existing first-sheet `rowCount` and `columnCount` fields keep their meanings.

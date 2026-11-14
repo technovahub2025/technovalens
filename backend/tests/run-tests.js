@@ -5,3 +5,8 @@ import "./workspace.test.js";
 import "./workspace-api.test.js";
 import "./streaming-parser.test.js";
 import "./parser-diagnostics.test.js";
+import './exact-spreadsheet.test.js';
+import './conversation-client.test.js';
+import './conversation-persistence.test.js';
+import './worksheet-selection.test.js';
+import './storage-management.test.js';

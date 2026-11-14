@@ -12,7 +12,7 @@ const DATES_NAMES_QUESTION = /\b(dates?|names?|people|organizations|companies|wh
 function splitPages(chunks = []) {
   const pages = new Map();
   for (const chunk of Array.isArray(chunks) ? chunks : []) {
-    let page = 1;
+    let page = null;
     for (const line of String(chunk || "").split(/\r?\n/)) {
       const header = line.match(/^Page\s+(\d+)(?:\s*\(continued\))?\s*$/i);
       if (header) { page = Number(header[1]); if (!pages.has(page)) pages.set(page, ""); }
@@ -122,7 +122,7 @@ function uniqueSentences(items, limit = 6) {
 }
 
 function withPages(items) {
-  return items.map(item => `${item.text} [Page ${item.page}]`);
+  return items.map(item => `${item.text}${item.page ? ` [Page ${item.page}]` : ' [extracted text; page unverified]'}`);
 }
 
 function extractionInfo(doc, pages) {
@@ -199,7 +199,7 @@ export function answerPdfLocally(doc, question, { forceSummary = false, onDiagno
       const picked = uniqueSentences(related.sort((a, b) => b.score - a.score), 2);
       if (!picked.length) continue;
       picked.forEach(item => used.add(item.index));
-      topicGroups.push(`- ${heading.text} [Page ${heading.page}]\n  ${withPages(picked).join("\n  ")}`);
+      topicGroups.push(`- ${heading.text}${heading.page ? ` [Page ${heading.page}]` : ''}\n  ${withPages(picked).join("\n  ")}`);
     }
     for (const item of topicCandidates) {
       if (topicGroups.length >= 5) break;
@@ -246,7 +246,7 @@ export function answerPdfLocally(doc, question, { forceSummary = false, onDiagno
   if (/\b(section|chapter|part)\b/i.test(q)) {
     const section = getRelevantSection(selectedPages, headings, queryTerms, pageNumber);
     if (section?.sectionSentences.length) {
-      return finish(`${section.heading.text} [Page ${section.heading.page}]:\n${withPages(uniqueSentences(section.sectionSentences, 6)).map(line => `- ${line}`).join("\n")}`);
+      return finish(`${section.heading.text}${section.heading.page ? ` [Page ${section.heading.page}]` : ''}:\n${withPages(uniqueSentences(section.sectionSentences, 6)).map(line => `- ${line}`).join("\n")}`);
     }
   }
 
