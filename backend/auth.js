@@ -3,6 +3,8 @@ import session from 'express-session';
 import MongoStore from 'connect-mongo';
 import argon2 from 'argon2';
 import crypto from 'node:crypto';
+import {hashOptions,normalizeUsername,passwordError,recoveryCodes} from './credentials.js';
+export {passwordError} from './credentials.js';
 
 const random=()=>crypto.randomBytes(32).toString('hex');
 const sha=value=>crypto.createHash('sha256').update(value).digest('hex');
@@ -11,18 +13,10 @@ const publicUser=user=>({id:user._id,username:user.username});
 const asyncRoute=handler=>(req,res,next)=>Promise.resolve(handler(req,res,next)).catch(next);
 const call=(object,method)=>new Promise((resolve,reject)=>object[method](error=>error?reject(error):resolve()));
 const equal=(a,b)=>typeof a==='string'&&typeof b==='string'&&/^[a-f0-9]{64}$/.test(a)&&/^[a-f0-9]{64}$/.test(b)&&crypto.timingSafeEqual(Buffer.from(a),Buffer.from(b));
-const normalizeUsername=value=>typeof value==='string'&&/^[a-zA-Z0-9][a-zA-Z0-9_.-]{2,31}$/.test(value)?value.toLowerCase():null;
-const hashOptions={type:argon2.argon2id,memoryCost:19456,timeCost:2,parallelism:1,hashLength:32};
 let hashing=0;
 async function boundedHash(work){
   if(hashing>=4)throw Object.assign(new Error('Authentication is busy. Try again shortly.'),{status:429,code:'AUTH_BUSY'});
   hashing++;try{return await work();}finally{hashing--;}
-}
-export function passwordError(password,username=''){
-  if(typeof password!=='string'||password.length<15||password.length>128)return 'Use 15–128 characters for your password.';
-  if(!/[a-z]/.test(password)||!/[A-Z]/.test(password)||!/[0-9]/.test(password))return 'Include uppercase and lowercase letters and a number. Symbols and spaces are welcome.';
-  if(/^(?:password|letmein|qwerty|welcome|admin|technovalens)[\W\d_]*$/i.test(password)||username.length>=3&&password.toLowerCase().includes(username.toLowerCase()))return 'Choose a less predictable password that does not contain your username.';
-  return '';
 }
 
 export async function createAuthentication({db,secret,allowedOrigins,production=false,secure=production,sameSite=production?'none':'lax',idleMs=30*60*1000,absoluteMs=8*60*60*1000,clock=Date.now,limits={}}){
@@ -72,26 +66,17 @@ export async function createAuthentication({db,secret,allowedOrigins,production=
       if(record.count>limit)throw Object.assign(new Error('Too many authentication attempts. Try again later.'),{status:429,code:'AUTH_RATE_LIMIT',retryAfter:Math.ceil(((window+1)*windowMs-now)/1000)});
     }
   }
-  const codesFor=id=>{const codes=Array.from({length:10},()=>crypto.randomBytes(16).toString('hex').match(/.{4}/g).join('-'));return {codes,hashes:codes.map(code=>sha(`${id}:${code.replace(/-/g,'').toLowerCase()}`))};};
+  const codesFor=recoveryCodes;
   const recoveryHash=(id,code)=>typeof code==='string'&&/^[a-f0-9-]{32,39}$/i.test(code)?sha(`${id}:${code.replace(/-/g,'').toLowerCase()}`):null;
   const revoke=async req=>revocations.updateOne({_id:sha(req.sessionID)},{$set:{expiresAt:new Date(clock()+absoluteMs+idleMs)}},{upsert:true});
   async function establish(req,user){await revoke(req);await call(req.session,'regenerate');Object.assign(req.session,{userId:user._id,sessionVersion:user.sessionVersion,authenticatedAt:clock(),lastSeen:clock(),csrfToken:random()});req.session.cookie.maxAge=Math.min(idleMs,absoluteMs);await call(req.session,'save');}
-  function credentials(body){const key=normalizeUsername(body.username);if(!key)return {error:'Use a username of 3–32 letters, numbers, dots, underscores or hyphens.'};const error=passwordError(body.password,key);return {key,error};}
   router.get('/auth/session',asyncRoute(async(req,res)=>{
     await rate(req,'bootstrap');
     const user=await readUser(req);
     if(!req.session)req.sessionStore.generate(req);
     res.json({user:user?publicUser(user):null,csrfToken:csrfToken(req)});
   }));
-  router.post('/auth/signup',csrf,asyncRoute(async(req,res)=>{
-    await rate(req,'signup');const {key,error}=credentials(req.body||{});
-    if(error)return res.status(400).json({error,code:'VALIDATION_ERROR'});
-    if(req.body.password!==req.body.confirmPassword)return res.status(400).json({error:'Passwords do not match.',code:'VALIDATION_ERROR'});
-    const id=crypto.randomUUID(),recovery=codesFor(id),passwordHash=await boundedHash(()=>argon2.hash(req.body.password,hashOptions));
-    const user={_id:id,username:req.body.username,usernameKey:key,passwordHash,recoveryHashes:recovery.hashes,sessionVersion:0,createdAt:new Date(clock()),disabled:false};
-    try{await users.insertOne(user);}catch(error){if(error.code===11000)return res.status(409).json({code:'USERNAME_UNAVAILABLE',error:'This username is unavailable. Choose another.'});throw error;}
-    await establish(req,user);res.status(201).json({user:publicUser(user),csrfToken:csrfToken(req),recoveryCodes:recovery.codes});
-  }));
+  router.all('/auth/signup',(_req,res)=>res.status(403).json({code:'SIGNUP_DISABLED',error:'Public signup is disabled. Contact the application administrator.'}));
   router.post('/auth/login',csrf,asyncRoute(async(req,res)=>{
     const key=normalizeUsername(req.body?.username);await rate(req,'login',key||'invalid');
     const user=key?await users.findOne({usernameKey:key}):null,password=req.body?.password;
@@ -110,6 +95,23 @@ export async function createAuthentication({db,secret,allowedOrigins,production=
     await sessions.deleteMany({'session.userId':user._id});await call(req.session,'destroy');res.clearCookie(name,{httpOnly:true,secure,sameSite,path:'/'});res.json({recovered:true});
   }));
   router.post('/auth/logout',csrf,asyncRoute(async(req,res)=>{await revoke(req);await call(req.session,'destroy');res.clearCookie(name,{httpOnly:true,secure,sameSite,path:'/'});res.json({loggedOut:true});}));
+  router.post('/auth/account',requireUser,csrf,asyncRoute(async(req,res)=>{
+    await rate(req,'account-security',req.authUser.usernameKey);
+    const {currentPassword,username=req.authUser.username,newPassword,confirmPassword}=req.body||{};
+    if(typeof currentPassword!=='string'||currentPassword.length>128||!await boundedHash(()=>argon2.verify(req.authUser.passwordHash,currentPassword)))return res.status(401).json({code:'INVALID_CREDENTIALS',error:'The current password is incorrect.'});
+    const key=normalizeUsername(username),changingPassword=newPassword!==undefined&&newPassword!=='';
+    const validation=!key?'Use a username of 3–32 letters, numbers, dots, underscores or hyphens.':changingPassword?passwordError(newPassword,key):'';
+    if(validation||changingPassword&&newPassword!==confirmPassword||!changingPassword&&confirmPassword)return res.status(400).json({code:'VALIDATION_ERROR',error:validation||'New passwords do not match.'});
+    if(!changingPassword&&username===req.authUser.username)return res.status(400).json({code:'VALIDATION_ERROR',error:'Change your username or enter a new password.'});
+    if(changingPassword&&await boundedHash(()=>argon2.verify(req.authUser.passwordHash,newPassword)))return res.status(400).json({code:'VALIDATION_ERROR',error:'Choose a different password from your current password.'});
+    const changes={username,usernameKey:key,...(changingPassword?{passwordHash:await boundedHash(()=>argon2.hash(newPassword,hashOptions)),passwordChangedAt:new Date(clock())}:{})};
+    let changed;
+    try{changed=await users.updateOne({_id:req.authUser._id,sessionVersion:req.authUser.sessionVersion},{$set:changes,$inc:{sessionVersion:1}});}
+    catch(error){if(error.code===11000)return res.status(409).json({code:'USERNAME_UNAVAILABLE',error:'This username is unavailable. Choose another.'});throw error;}
+    if(!changed.matchedCount)return res.status(401).json({code:'AUTH_REQUIRED',error:'Your account changed. Sign in again.'});
+    await sessions.deleteMany({'session.userId':req.authUser._id});await revoke(req);await call(req.session,'destroy');res.clearCookie(name,{httpOnly:true,secure,sameSite,path:'/'});
+    res.json({updated:true,signInRequired:true});
+  }));
   router.post('/auth/recovery-codes',requireUser,csrf,asyncRoute(async(req,res)=>{
     await rate(req,'recovery-codes',req.authUser.usernameKey);
     if(typeof req.body?.password!=='string'||req.body.password.length>128||!await boundedHash(()=>argon2.verify(req.authUser.passwordHash,req.body.password)))return res.status(401).json({code:'INVALID_CREDENTIALS',error:'Invalid username or password.'});

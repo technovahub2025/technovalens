@@ -21,6 +21,7 @@ import { planSpreadsheetQuestion, answerSheetQuestion, resolveWorksheetScope } f
 import { JsonConversationStore } from "./storage/json-conversation-store.js";
 import { LocalDocumentCache } from './storage/local-document-cache.js';
 import {createAuthentication} from './auth.js';
+import {authenticationProxyHops,authenticationOrigins} from './auth-config.js';
 
 // Resolve the backend .env from this file, regardless of the directory used to start Node.
 const envPath = fileURLToPath(new URL("./.env", import.meta.url));
@@ -45,24 +46,13 @@ if (GEMINI_API_BASE_URL) {
 
 const app = express();
 app.disable('x-powered-by');
-const proxyHops=Number(process.env.AUTH_TRUST_PROXY_HOPS??0);
-if(!Number.isInteger(proxyHops)||proxyHops<0||proxyHops>3)throw new Error('AUTH_TRUST_PROXY_HOPS must be an integer from 0 to 3.');
+const proxyHops=authenticationProxyHops();
 app.set('trust proxy',proxyHops);
 let localCache;
 let authentication;
 const storageReadOnly=process.env.STORAGE_READ_ONLY==='true';
 
-const allowedOrigins = new Set([
-  "http://localhost:5173",
-  "https://technovalens.vercel.app",
-  "https://technovahub.in",
-  "https://www.technovahub.in"
-]);
-for(const origin of (process.env.AUTH_ALLOWED_ORIGINS||'').split(',').map(value=>value.trim()).filter(Boolean)){
-  let parsed;try{parsed=new URL(origin);}catch{throw new Error('AUTH_ALLOWED_ORIGINS must contain exact HTTP(S) origins.');}
-  if(!['http:','https:'].includes(parsed.protocol)||parsed.origin!==origin)throw new Error('AUTH_ALLOWED_ORIGINS must contain exact HTTP(S) origins, without paths or wildcards.');
-  allowedOrigins.add(origin);
-}
+const allowedOrigins = authenticationOrigins();
 
 const corsOptions = {
   origin: (origin, callback) => {

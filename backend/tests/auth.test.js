@@ -13,39 +13,50 @@ import {createAuthentication,accountOwner,passwordError} from '../auth.js';
 import {rawFetch} from './auth-test-client.js';
 import {MongoDocumentStore} from '../storage/mongo-document-store.js';
 import {diagnosticClient} from '../diagnostic-auth.js';
+import {createStoredAccount,provisionInitialAdmin} from '../credentials.js';
+import {authenticationProxyHops,authenticationOrigins} from '../auth-config.js';
 
 const password=()=>`Strong-7aA-${crypto.randomBytes(16).toString('hex')}`;
 const username=()=>`user_${crypto.randomBytes(6).toString('hex')}`;
-function browser(base){
+const databases=new Map();
+function browser(base,db=databases.get(base)){
   let cookie='',csrf='';
   const request=async(route,options={})=>{
     const headers=new Headers(options.headers);if(cookie)headers.set('Cookie',cookie);if(csrf&&!['GET','HEAD','OPTIONS'].includes(options.method||'GET'))headers.set('X-CSRF-Token',csrf);
     const response=await rawFetch(base+route,{...options,headers});const updated=response.headers.getSetCookie();if(updated.length)cookie=updated.map(value=>value.split(';')[0]).join('; ');return response;
   };
   const json=async(route,body)=>{const response=await request(route,{method:body===undefined?'GET':'POST',...(body===undefined?{}:{headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})});const data=await response.json();if(data.csrfToken)csrf=data.csrfToken;return {response,data};};
-  return {request,json,get cookie(){return cookie;},get csrf(){return csrf;},bootstrap:()=>json('/auth/session')};
+  return {db,request,json,get cookie(){return cookie;},get csrf(){return csrf;},bootstrap:()=>json('/auth/session')};
 }
 async function fixture(options={}){
   const client=new MongoClient(process.env.MONGODB_URI);await client.connect();const db=client.db(`auth_case_${crypto.randomBytes(8).toString('hex')}`);
-  let now=Date.now();const app=express();if(options.production)app.set('trust proxy',1);app.use(express.json());
+  let now=Date.now();const app=express();app.set('trust proxy',options.proxyHops??(options.production?1:0));app.use(express.json());
   const auth=await createAuthentication({db,secret:process.env.SESSION_SECRET,allowedOrigins:new Set(['https://app.example']),clock:()=>now,...options});
   app.use('/api',auth.middleware);app.get('/api/private',(req,res)=>res.json({id:req.authUser._id,owner:req.ownerHash}));app.post('/api/private',(req,res)=>res.json({changed:true}));app.use((_error,_req,res,_next)=>res.status(503).json({error:'Authentication unavailable.'}));
   const server=app.listen(0,'127.0.0.1');await once(server,'listening');const base=`http://127.0.0.1:${server.address().port}/api`;
+  databases.set(base,db);
   return {auth,db,base,browser:()=>browser(base),advance:ms=>{now+=ms;},async close(){server.closeAllConnections();await new Promise(resolve=>server.close(resolve));await db.dropDatabase();await client.close();}};
 }
-async function signup(actor,input={}){await actor.bootstrap();const credentials={username:username(),password:password(),...input};return {...await actor.json('/auth/signup',{...credentials,confirmPassword:credentials.password}),credentials};}
+async function provisionAndLogin(actor,input={}){
+  await actor.bootstrap();const credentials={username:username(),password:password(),...input};
+  const record=await createStoredAccount(actor.db,credentials),loggedIn=await actor.json('/auth/login',credentials);
+  assert.equal(loggedIn.response.status,200);
+  return {...loggedIn,data:{...loggedIn.data,recoveryCodes:record.recoveryCodes},credentials};
+}
 
-test('MongoDB signup hashes passwords with Argon2id, rejects weak/duplicate/injected names and rotates session/CSRF tokens',async()=>{
+test('public signup is disabled; provisioned passwords use Argon2id and login rotates session/CSRF tokens',async()=>{
   const f=await fixture();try{
     const actor=f.browser();await actor.bootstrap();const anonymous=actor.cookie,oldCsrf=actor.csrf;
     const credentials={username:username(),password:password()};
-    assert.equal((await actor.json('/auth/signup',{username:credentials.username,password:'short',confirmPassword:'short'})).response.status,400);
-    const created=await actor.json('/auth/signup',{...credentials,confirmPassword:credentials.password});assert.equal(created.response.status,201);assert.equal(created.data.recoveryCodes.length,10);assert.notEqual(actor.cookie,anonymous);assert.notEqual(actor.csrf,oldCsrf);
+    assert.equal((await actor.json('/auth/signup',{...credentials,confirmPassword:credentials.password})).response.status,403);
+    assert.equal(await f.db.collection('auth_users').countDocuments(),0);
+    await assert.rejects(createStoredAccount(f.db,{...credentials,password:'short'}),{code:'VALIDATION_ERROR'});
+    const created=await provisionAndLogin(actor,credentials);assert.equal(created.response.status,200);assert.equal(created.data.recoveryCodes.length,10);assert.notEqual(actor.cookie,anonymous);assert.notEqual(actor.csrf,oldCsrf);
     const record=await f.db.collection('auth_users').findOne({_id:created.data.user.id});assert.match(record.passwordHash,/^\$argon2id\$v=19\$m=19456,t=2,p=1\$/);assert.equal(await argon2.verify(record.passwordHash,credentials.password),true);assert.ok(!JSON.stringify(record).includes(credentials.password));assert.ok(!JSON.stringify(record).includes(created.data.recoveryCodes[0]));assert.equal('passwordHash' in created.data,false);
     const cookie=created.response.headers.getSetCookie().join(';');assert.match(cookie,/HttpOnly/);assert.match(cookie,/SameSite=Lax/);assert.match(cookie,/Path=\//);
     assert.equal((await rawFetch(f.base+'/private',{headers:{Cookie:anonymous}})).status,401);
-    const duplicate=f.browser();await duplicate.bootstrap();assert.equal((await duplicate.json('/auth/signup',{...credentials,username:credentials.username.toUpperCase(),confirmPassword:credentials.password})).response.status,409);
-    assert.equal((await duplicate.json('/auth/signup',{username:{$ne:null},password:credentials.password,confirmPassword:credentials.password})).response.status,400);
+    const duplicate=f.browser();await duplicate.bootstrap();await assert.rejects(createStoredAccount(f.db,{...credentials,username:credentials.username.toUpperCase()}),{code:'USERNAME_UNAVAILABLE'});
+    assert.equal((await duplicate.json('/auth/login',{username:{$ne:null},password:credentials.password})).response.status,401);
     const wrong=await duplicate.json('/auth/login',{username:credentials.username,password:password()}),unknown=await duplicate.json('/auth/login',{username:username(),password:password()});assert.equal(wrong.response.status,401);assert.deepEqual(wrong.data,unknown.data);
     assert.equal(passwordError('Password123456789'),'Choose a less predictable password that does not contain your username.');
   }finally{await f.close();}
@@ -53,7 +64,7 @@ test('MongoDB signup hashes passwords with Argon2id, rejects weak/duplicate/inje
 
 test('session cookies require CSRF and trusted origins; logout and revocation survive a stale-session rewrite',async()=>{
   const f=await fixture();try{
-    const actor=f.browser(),created=await signup(actor),cookie=actor.cookie;
+    const actor=f.browser(),created=await provisionAndLogin(actor),cookie=actor.cookie;
     for(const headers of [{Cookie:cookie},{Cookie:cookie,'X-CSRF-Token':'wrong'},{Cookie:cookie,'X-CSRF-Token':'é'.repeat(64)},{Cookie:cookie,'X-CSRF-Token':actor.csrf,Origin:'https://evil.example'}])assert.equal((await rawFetch(f.base+'/private',{method:'POST',headers})).status,403);
     assert.equal((await actor.json('/private',{})).response.status,200);
     const saved=await f.db.collection('auth_sessions').findOne({'session.userId':created.data.user.id});assert.equal(saved._id.length,64);assert.ok(!cookie.includes(saved._id),'raw session IDs are not stored as Mongo IDs');
@@ -64,7 +75,7 @@ test('session cookies require CSRF and trusted origins; logout and revocation su
 
 test('recovery codes are one-time, atomically consumed and revoke all existing sessions',async()=>{
   const f=await fixture();try{
-    const actor=f.browser(),created=await signup(actor),oldCookie=actor.cookie,code=created.data.recoveryCodes[0],replacement=password();
+    const actor=f.browser(),created=await provisionAndLogin(actor),oldCookie=actor.cookie,code=created.data.recoveryCodes[0],replacement=password();
     const recover=f.browser();await recover.bootstrap();
     assert.equal((await recover.json('/auth/recover',{username:created.credentials.username,recoveryCode:'bad',password:replacement,confirmPassword:replacement})).response.status,400);
     const results=await Promise.all([recover,await(async()=>{const other=f.browser();await other.bootstrap();return other;})()].map(browser=>browser.json('/auth/recover',{username:created.credentials.username,recoveryCode:code,password:replacement,confirmPassword:replacement})));
@@ -80,8 +91,8 @@ test('recovery codes are one-time, atomically consumed and revoke all existing s
 
 test('per-account/IP rate limits, idle expiration and absolute expiration are enforced server-side',async()=>{
   const f=await fixture({idleMs:1000,absoluteMs:2500,limits:{account:2,ip:20}});try{
-    const actor=f.browser(),created=await signup(actor);f.advance(900);assert.equal((await actor.request('/private')).status,200);f.advance(900);assert.equal((await actor.request('/private')).status,200);f.advance(800);assert.equal((await actor.request('/private')).status,401,'absolute timeout cannot be extended by activity');
-    const login=f.browser();await login.bootstrap();for(const expected of [401,401,429]){const result=await login.json('/auth/login',{username:created.credentials.username,password:password()});assert.equal(result.response.status,expected);if(expected===429)assert.ok(result.response.headers.get('retry-after'));}
+    const actor=f.browser(),created=await provisionAndLogin(actor);f.advance(900);assert.equal((await actor.request('/private')).status,200);f.advance(900);assert.equal((await actor.request('/private')).status,200);f.advance(800);assert.equal((await actor.request('/private')).status,401,'absolute timeout cannot be extended by activity');
+    f.advance(16*60*1000);const login=f.browser();await login.bootstrap();for(const expected of [401,401,429]){const result=await login.json('/auth/login',{username:created.credentials.username,password:password()});assert.equal(result.response.status,expected);if(expected===429)assert.ok(result.response.headers.get('retry-after'));}
     f.advance(16*60*1000);assert.equal((await login.json('/auth/login',created.credentials)).response.status,200);f.advance(1001);assert.equal((await login.request('/private')).status,401,'idle deadline is checked without waiting for Mongo TTL cleanup');
   }finally{await f.close();}
 });
@@ -90,7 +101,7 @@ test('production configuration refuses insecure cookies and session-store errors
   const f=await fixture();try{
     await assert.rejects(createAuthentication({db:f.db,secret:'short',allowedOrigins:new Set()}),/SESSION_SECRET/);
     await assert.rejects(createAuthentication({db:f.db,secret:process.env.SESSION_SECRET,production:true,secure:false,allowedOrigins:new Set()}),/Secure/);
-    const actor=f.browser();await signup(actor);const get=f.auth.store.get;f.auth.store.get=(_sid,callback)=>callback(new Error('simulated outage'));
+    const actor=f.browser();await provisionAndLogin(actor);const get=f.auth.store.get;f.auth.store.get=(_sid,callback)=>callback(new Error('simulated outage'));
     assert.equal((await actor.request('/private')).status,503);f.auth.store.get=get;
   }finally{await f.close();}
 });
@@ -99,15 +110,83 @@ test('production cookies are Secure, HttpOnly, host-only and cross-site compatib
   const f=await fixture({production:true});try{
     assert.equal((await rawFetch(f.base+'/auth/session')).status,426);
     const bootstrap=await rawFetch(f.base+'/auth/session',{headers:{'X-Forwarded-Proto':'https'}}),preCookie=bootstrap.headers.getSetCookie().map(value=>value.split(';')[0]).join('; '),{csrfToken}=await bootstrap.json();
-    const input={username:username(),password:password()};
-    const created=await rawFetch(f.base+'/auth/signup',{method:'POST',headers:{'Content-Type':'application/json','X-Forwarded-Proto':'https','X-CSRF-Token':csrfToken,Cookie:preCookie},body:JSON.stringify({...input,confirmPassword:input.password})});assert.equal(created.status,201);
+    const input={username:username(),password:password()};await createStoredAccount(f.db,input);
+    const created=await rawFetch(f.base+'/auth/login',{method:'POST',headers:{'Content-Type':'application/json','X-Forwarded-Proto':'https','X-CSRF-Token':csrfToken,Cookie:preCookie},body:JSON.stringify({...input,confirmPassword:input.password})});assert.equal(created.status,200);
     const cookie=created.headers.getSetCookie().join(';');assert.match(cookie,/__Host-technovalens.sid=/);assert.match(cookie,/; Secure/);assert.match(cookie,/; HttpOnly/);assert.match(cookie,/SameSite=None/);assert.doesNotMatch(cookie,/Domain=/);
+  }finally{await f.close();}
+});
+
+test('Render proxy detection trusts only configured hops and never accepts spoofed HTTPS without proxy trust',async()=>{
+  assert.equal(authenticationProxyHops({RENDER:'true'}),1);
+  assert.equal(authenticationProxyHops({}),0);
+  assert.equal(authenticationProxyHops({RENDER:'true',AUTH_TRUST_PROXY_HOPS:'0'}),0);
+  for(const value of ['true','-1','4','','1.0'])assert.throws(()=>authenticationProxyHops({AUTH_TRUST_PROXY_HOPS:value}));
+  const origins=authenticationOrigins({NODE_ENV:'production'});
+  assert.ok(origins.has('https://technovahub.in'));assert.ok(!origins.has('http://localhost:5173'));assert.ok(!origins.has('https://technovahub.in/technovalens'));
+  assert.throws(()=>authenticationOrigins({AUTH_ALLOWED_ORIGINS:'https://technovahub.in/path'}));
+  const untrusted=await fixture({production:true,proxyHops:0});
+  try{assert.equal((await rawFetch(untrusted.base+'/auth/session',{headers:{'X-Forwarded-Proto':'https'}})).status,426);}finally{await untrusted.close();}
+  const trusted=await fixture({production:true,proxyHops:authenticationProxyHops({RENDER:'true'})});
+  try{
+    for(const proto of ['http','http, https','garbage'])assert.equal((await rawFetch(trusted.base+'/auth/session',{headers:{'X-Forwarded-Proto':proto}})).status,426);
+    const response=await rawFetch(trusted.base+'/auth/session',{headers:{'X-Forwarded-Proto':'https'}});assert.equal(response.status,200);assert.match(response.headers.getSetCookie().join(';'),/Secure/);
+  }finally{await trusted.close();}
+});
+
+test('first administrator provisioning is explicit, singleton, permanently locked and preserves existing users',async()=>{
+  const f=await fixture();try{
+    await assert.rejects(provisionInitialAdmin(f.db,{password:'admin123'}));assert.equal(await f.db.collection('auth_bootstrap').countDocuments(),0);
+    const legacy=await createStoredAccount(f.db,{username:username(),password:password()});
+    const saved=await f.db.collection('auth_users').findOne({_id:legacy.user._id});
+    const results=await Promise.allSettled([provisionInitialAdmin(f.db,{username:'admin',password:password()}),provisionInitialAdmin(f.db,{username:'another_admin',password:password()})]);
+    assert.equal(results.filter(result=>result.status==='fulfilled').length,1);
+    const admin=await f.db.collection('auth_users').findOne({initialAdmin:true});assert.equal(admin.role,'admin');assert.match(admin.passwordHash,/^\$argon2id\$/);
+    assert.equal((await f.db.collection('auth_bootstrap').findOne({_id:'initial-admin'})).status,'complete');
+    await f.db.collection('auth_users').updateOne({_id:admin._id},{$set:{username:'renamed',usernameKey:'renamed'}});
+    await assert.rejects(provisionInitialAdmin(f.db,{username:'third_admin',password:password()}),/disabled/);
+    await f.db.collection('auth_users').deleteOne({_id:admin._id});
+    await assert.rejects(provisionInitialAdmin(f.db,{username:'fourth_admin',password:password()}),/disabled/);
+    assert.deepEqual(await f.db.collection('auth_users').findOne({_id:saved._id}),saved);
+  }finally{await f.close();}
+});
+
+test('interrupted admin setup remains locked instead of allowing a second bootstrap',async()=>{
+  const f=await fixture();try{
+    await f.db.collection('auth_bootstrap').insertOne({_id:'initial-admin',status:'locked'});
+    await assert.rejects(provisionInitialAdmin(f.db,{password:password()}),/locked/);
+    assert.equal(await f.db.collection('auth_users').countDocuments(),0);
+  }finally{await f.close();}
+});
+
+test('account security verifies current password, validates changes and revokes every session while preserving ownership',async()=>{
+  const f=await fixture();try{
+    const actor=f.browser(),created=await provisionAndLogin(actor),other=f.browser(),anonymous=f.browser();
+    await other.bootstrap();assert.equal((await other.json('/auth/login',created.credentials)).response.status,200);
+    const originalCookie=actor.cookie,otherCookie=other.cookie,newUsername=username(),newPassword=password();
+    await anonymous.bootstrap();assert.equal((await anonymous.json('/auth/account',{currentPassword:created.credentials.password,username:newUsername})).response.status,401);
+    assert.equal((await rawFetch(f.base+'/auth/account',{method:'POST',headers:{Cookie:actor.cookie,'Content-Type':'application/json'},body:'{}'})).status,403);
+    assert.equal((await actor.json('/auth/account',{currentPassword:'wrong',username:newUsername})).response.status,401);
+    const input={currentPassword:created.credentials.password,username:newUsername,newPassword,confirmPassword:newPassword};
+    assert.equal((await actor.json('/auth/account',{...input,newPassword:'short',confirmPassword:'short'})).response.status,400);
+    assert.equal((await actor.json('/auth/account',{...input,confirmPassword:'mismatch'})).response.status,400);
+    assert.equal((await actor.json('/auth/account',{...input,username:{$ne:null}})).response.status,400);
+    assert.equal((await actor.json('/auth/account',{...input,newPassword:created.credentials.password,confirmPassword:created.credentials.password})).response.status,400);
+    const taken=await createStoredAccount(f.db,{username:username(),password:password()});
+    assert.equal((await actor.json('/auth/account',{...input,username:taken.user.username.toUpperCase()})).response.status,409);
+    const response=await actor.json('/auth/account',input);assert.equal(response.response.status,200);assert.equal(response.data.signInRequired,true);
+    for(const cookie of [originalCookie,otherCookie])assert.equal((await rawFetch(f.base+'/private',{headers:{Cookie:cookie}})).status,401);
+    const record=await f.db.collection('auth_users').findOne({_id:created.data.user.id});assert.equal(record.username,newUsername);assert.ok(await argon2.verify(record.passwordHash,newPassword));assert.equal(record.sessionVersion,1);
+    const login=f.browser();await login.bootstrap();assert.equal((await login.json('/auth/login',created.credentials)).response.status,401);
+    assert.equal((await login.json('/auth/login',{username:newUsername,password:created.credentials.password})).response.status,401);
+    assert.equal((await login.json('/auth/login',{username:newUsername,password:newPassword})).response.status,200);
+    assert.equal((await login.json('/private')).data.owner,accountOwner(created.data.user.id));
+    assert.equal((await login.json('/auth/account',{username:username(),currentPassword:newPassword})).response.status,200,'username-only changes also verify password and revoke sessions');
   }finally{await f.close();}
 });
 
 test('MongoDB sessions survive middleware restarts and disabled accounts lose access immediately',async()=>{
   const f=await fixture();let restarted;try{
-    const actor=f.browser(),created=await signup(actor),app=express();app.use(express.json());
+    const actor=f.browser(),created=await provisionAndLogin(actor),app=express();app.use(express.json());
     const auth=await createAuthentication({db:f.db,secret:process.env.SESSION_SECRET,allowedOrigins:new Set(['https://app.example'])});app.use('/api',auth.middleware);app.get('/api/private',(req,res)=>res.json({owner:req.ownerHash}));
     restarted=app.listen(0,'127.0.0.1');await once(restarted,'listening');const url=`http://127.0.0.1:${restarted.address().port}/api/private`;
     const restored=await rawFetch(url,{headers:{Cookie:actor.cookie}});assert.equal(restored.status,200);assert.equal((await restored.json()).owner,accountOwner(created.data.user.id));
@@ -121,8 +200,11 @@ test('real MongoDB/GridFS endpoints enforce account ownership and never adopt ex
   const child=spawn(process.execPath,['server.js'],{cwd:path.resolve(import.meta.dirname,'..'),env:{...process.env,PORT:String(port),MONGODB_DB_NAME:dbName,CONVERSATION_STORAGE:'mongo',DOCUMENT_STORE_DIR:directory,GEMINI_API_KEY:''},stdio:'ignore'});const base=`http://127.0.0.1:${port}/api`;
   try{
     let ready=false;for(let i=0;i<200;i++){try{if((await rawFetch(base+'/health')).ok){ready=true;break;}}catch{}await new Promise(resolve=>setTimeout(resolve,50));}assert.ok(ready,'authenticated backend started');
+    const cors=await rawFetch(base+'/health',{headers:{Origin:'https://technovahub.in'}});assert.equal(cors.headers.get('Access-Control-Allow-Origin'),'https://technovahub.in');assert.equal(cors.headers.get('Access-Control-Allow-Credentials'),'true');
+    const preflight=await rawFetch(base+'/auth/login',{method:'OPTIONS',headers:{Origin:'https://technovahub.in','Access-Control-Request-Method':'POST','Access-Control-Request-Headers':'Content-Type,X-CSRF-Token'}});assert.equal(preflight.status,204);assert.match(preflight.headers.get('Access-Control-Allow-Headers'),/X-CSRF-Token/i);
+    const rejectedOrigin=await rawFetch(base+'/health',{headers:{Origin:'https://technovahub.in.attacker.example'}});assert.equal(rejectedOrigin.headers.get('Access-Control-Allow-Origin'),null);
     for(const route of ['/files','/conversations','/usage','/reports/'+crypto.randomUUID()+'.xlsx'])assert.equal((await rawFetch(base+route,{headers:{'X-Workspace-Token':'a'.repeat(64)}})).status,401);
-    const a=browser(base),b=browser(base),first=await signup(a),second=await signup(b);assert.notEqual(first.data.user.id,second.data.user.id);
+    const a=browser(base,db),b=browser(base,db),first=await provisionAndLogin(a),second=await provisionAndLogin(b);assert.notEqual(first.data.user.id,second.data.user.id);
     const form=new FormData();form.append('file',new Blob(['Name,Revenue\nNorth,100\nSouth,50\n']),'private.csv');const uploaded=await a.request('/files/upload',{method:'POST',body:form});assert.equal(uploaded.status,200);const file=await uploaded.json();
     const record=await db.collection('documents').findOne({_id:file.fileId});assert.equal(record.ownerHash,accountOwner(first.data.user.id));for(const blob of await db.collection('document_data.files').find({'metadata.fileId':file.fileId}).toArray())assert.equal(blob.metadata.ownerHash,record.ownerHash);
     const diagnostic=await diagnosticClient(`http://127.0.0.1:${port}`,first.credentials);assert.equal((await diagnostic.request(`/files/${file.fileId}`)).status,200);await diagnostic.logout();assert.equal((await a.request(`/files/${file.fileId}`)).status,200,'diagnostic logout does not invalidate another session');

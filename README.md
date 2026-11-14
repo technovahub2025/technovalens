@@ -55,7 +55,7 @@ In a second terminal run `npm run dev` in `frontend`. Production verification: `
 
 ### Accounts, sessions and existing uploads
 
-Sign up with a unique username and strong password, then save the ten one-time recovery codes shown once. No email or Google account is required. Passwords use Argon2id. Accounts and signed server-side sessions are stored in MongoDB; browsers use HttpOnly session cookies and session-bound CSRF headers. Login/account rate limits, idle/absolute expiration, session rotation, logout revocation and recovery-code replay protection are enforced by the backend. See [authentication setup and verification](backend/authentication.md).
+The frontend opens on Admin Login with username and password. Public signup is disabled. For first-time setup, review the intended MongoDB connection, then run `npm run admin:setup` in a private interactive terminal inside `backend`. It securely prompts for an initial username (default `admin`) and strong password without echoing credentials, stores an Argon2id hash, and permanently locks bootstrap after claiming its singleton setup record. No account is created automatically at server startup. Existing accounts and their data remain intact. Under Settings > Account Security, change credentials or issue one-time recovery codes. See [authentication setup and verification](backend/authentication.md).
 
 All document, upload/progress, chat, history, analytics and report endpoints require an authenticated account. The frontend Axios client and streaming fetch wrapper send credentials; session/CSRF secrets are never stored in localStorage or download URLs. Browser preferences are scoped by account ID. Logging out or changing accounts unmounts the old workspace.
 
@@ -63,7 +63,7 @@ Existing anonymous documents and conversations are preserved with their original
 
 #### HTTPS hosting configuration
 
-Set NODE_ENV=production, provide a separate random SESSION_SECRET, and set AUTH_TRUST_PROXY_HOPS to the exact number of trusted HTTPS proxy hops (normally 1 for Render, default 0). Production rejects insecure authentication requests. Cookies are Secure and HttpOnly, with SameSite=None for the existing cross-site frontend/backend origins; same-site deployments may use Lax. Add only exact trusted frontend origins using AUTH_ALLOWED_ORIGINS. CORS must allow credentials and X-CSRF-Token.
+Set NODE_ENV=production and provide a separate random SESSION_SECRET. Proxy trust defaults to one hop when Render sets RENDER=true, and zero elsewhere. AUTH_TRUST_PROXY_HOPS overrides that default: use the exact trusted hop count; an explicit zero on Render will reject TLS-terminated requests. The Render default allows Express req.secure to recognize the trusted proxy's X-Forwarded-Proto=https without disabling HTTPS checks. Production rejects insecure authentication requests. Cookies are Secure and HttpOnly, with SameSite=None for the existing cross-site frontend/backend origins; same-site deployments may use Lax. Production CORS permits the exact https://technovahub.in and https://www.technovahub.in origins with credentials and X-CSRF-Token. Add only exact additional trusted origins using AUTH_ALLOWED_ORIGINS (no /technovalens path).
 
 The existing frontend API build URL and routes are unchanged. For the documented backend use VITE_API_URL=https://technovalens.onrender.com during the frontend build. Cross-site cookies can be blocked by browser privacy settings: host the API on the same site or behind a same-origin HTTPS reverse proxy if necessary; do not weaken cookie or CSRF protection. No deployment was performed by this implementation.
 
@@ -84,7 +84,7 @@ All accept optional `sheet`, `search`, `categoryColumn` and `categoryValue`. Pre
 
 Implementation: `frontend/src/AnalyticsReports.jsx`, `frontend/src/workspace.js` and scoped additions in `styles.css`; integration in `App.jsx` and the local proxy default in `vite.config.js`. Backend changes are in `analytics.js`, `spreadsheet-parser.js`, `reports.js`, `server.js`, the optional `storage/file-conversation-store.js`, and `migrate-workspace.js`. Coverage lives in `backend/tests/analytics-reports.test.js`; the API suite uses isolated authenticated accounts.
 
-Run `node tests/run-tests.js --auth-ui` from `backend` for the isolated authenticated Edge browser smoke test, including desktop/mobile login and signup, upload, logout, recovery and restored document access. See the authentication guide for requirements. The older optional `tests/browser-smoke.mjs` predates account authentication.
+Run `node tests/run-tests.js --auth-ui` from `backend` for the isolated authenticated Edge browser smoke test, including desktop/mobile Admin Login, Account Security, username/password changes, upload, logout, recovery and restored document access. See the authentication guide for requirements. The older optional `tests/browser-smoke.mjs` predates account authentication.
 
 ### Local upload diagnostics
 

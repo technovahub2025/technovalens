@@ -1021,7 +1021,7 @@ export default function App({authUser,onLogout,onManageRecovery}) {
 
         <div className="sidebar-bottom">
 
-          <button className="nav-item" onClick={onManageRecovery} title="Manage account recovery codes">
+          <button className="nav-item" onClick={onManageRecovery} title="Account Security">
             <Settings size={18} />
             <span>Settings</span>
           </button>

@@ -10,7 +10,8 @@
     "verify:models": "node verify-models.js",
     "migrate:workspace": "node migrate-workspace.js",
     "audit:storage": "node audit-storage.mjs",
-    "auth:configure": "node configure-auth.mjs"
+    "auth:configure": "node configure-auth.mjs",
+    "admin:setup": "node setup-admin.mjs"
   },
   "dependencies": {
     "@google/genai": "^2.32.0",
