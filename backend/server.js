@@ -1,3 +1,4 @@
+import {getHttpStatus,getProviderErrorDetails,classifyGeminiQuota,isDailyGeminiQuotaError,userFacingGeminiError} from './gemini-errors.js';
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -14,7 +15,7 @@ import fs from "fs";
 import path from "path";
 import { analyzeDataset, previewDataset, answerLocally, buildCompactSheetContext, hashWorkbook, normalizeQuestion } from "./analytics.js";
 import { answerPdfLocally, localLimitation } from "./local-document.js";
-import {classifyPdfQuestion,pdfAnalysisPrompt,formatPdfAnalysis,missingInformationSuggestions,retrievePdfEvidence,pdfAnswerUsesKnownFigures} from './pdf-questions.js';
+import {classifyPdfQuestion,pdfAnalysisPrompt,formatPdfAnalysis,missingInformationSuggestions,retrievePdfEvidence,pdfAnswerUsesKnownFigures,normalizePdfQuestion,answerVerifiedPdfQuestion} from './pdf-questions.js';
 import { connectDB, getDB } from "./config/db.js";
 import { MongoDocumentStore } from './storage/mongo-document-store.js';
 import { planSpreadsheetQuestion, answerSheetQuestion, resolveWorksheetScope } from './exact-spreadsheet.js';
@@ -156,7 +157,7 @@ let conversationStore;
 let durableDocuments;
 const CACHE_PATH = path.join(DATA_DIR, "analysis-cache.json");
 const USAGE_PATH = path.join(DATA_DIR, "gemini-usage.json");
-const PROMPT_VERSION = "2026-11-14-grounded-pdf-v5";
+const PROMPT_VERSION = "2026-11-15-division-pdf-v6";
 const CACHE_TTL_MS = Math.max(60_000, Number(process.env.ANALYSIS_CACHE_TTL_MS) || 24 * 60 * 60 * 1000);
 const requestedDailyBudget = Number.parseInt(process.env.GEMINI_DAILY_BUDGET, 10);
 const DAILY_GEMINI_BUDGET = Number.isInteger(requestedDailyBudget) ? Math.max(0, requestedDailyBudget) : 15;
@@ -879,30 +880,7 @@ const gemini = GEMINI_API_KEY
     })
   : null;
 
-function getHttpStatus(error) {
-  const providerError = getProviderErrorDetails(error).body;
-  const directStatus = Number(error?.status ?? error?.statusCode ?? error?.response?.status ?? providerError?.code);
-  if (directStatus >= 400 && directStatus <= 599) return directStatus;
-  const errorText = `${providerError?.status || ""} ${error?.message || ""} ${error?.code || ""}`;
-  const match = errorText.match(/(?:HTTP\s*|status[:= ]+)?(400|401|403|404|408|409|413|422|429|500|501|502|503|504)\b/i);
-  if (match) return Number(match[1]);
-  if (error?.name === "RequestTimeoutError" || /deadline[_ ]exceeded|deadline expired|request timed? ?out|timeout/i.test(errorText)) return 504;
-  return null;
-}
 
-function getProviderErrorDetails(error) {
-  let body;
-  try { body = JSON.parse(error?.message || ""); } catch { /* SDK/network errors may not contain a JSON body. */ }
-  const providerError = body?.error && typeof body.error === "object" ? body.error : null;
-  const code = Number(providerError?.code ?? error?.status ?? error?.statusCode);
-  return {
-    body: providerError,
-    code: Number.isInteger(code) && code >= 400 && code <= 599 ? code : null,
-    status: typeof providerError?.status === "string" ? providerError.status : null,
-    message: typeof providerError?.message === "string" ? providerError.message : null,
-    retryDelay: providerError?.details?.find?.(detail => /RetryInfo/.test(detail?.["@type"] || ""))?.retryDelay || null
-  };
-}
 
 function safeProviderMessage(message, prompt) {
   if (!message) return null;
@@ -931,23 +909,6 @@ function shouldRetryGeminiError(status, providerError, error) {
   return /retryDelay|rate.?limit|requests per|tokens per|too many requests/i.test(`${message} ${details}`);
 }
 
-function classifyGeminiQuota(providerError) {
-  if (providerError?.code !== 429) return null;
-  const message = providerError.message || "";
-  const details = providerError.body?.details || [];
-  const info = details.find(detail => /ErrorInfo/.test(detail?.["@type"] || "")) || {};
-  const metadata = info.metadata || {};
-  const quotaId = String(metadata.quotaId || metadata.quota_id || "");
-  const quotaMetric = String(metadata.quotaMetric || metadata.quota_metric || "");
-  const resourceNames = [metadata.model, metadata.modelId, metadata.model_id, metadata.consumer].filter(Boolean).join(" ");
-  const text = `${message} ${quotaId} ${quotaMetric} ${resourceNames}`;
-  if (!/daily|per.?day|requestsperday|quota.*exhaust|exhaust.*quota/i.test(text)) return null;
-  // Google quota errors commonly include a quota ID / metric scoped per model.
-  // If the provider gives no scope, fail closed as project-wide.
-  if (/per.?model|model.*(request|quota|limit)|(?:^|\s)model(?:\s|$)/i.test(`${quotaId} ${quotaMetric} ${resourceNames}`)) return "model-daily";
-  if (/project.?wide|per.?project(?!.*model)|project.*(request|quota|limit)/i.test(`${quotaId} ${quotaMetric} ${resourceNames} ${message}`)) return "project-wide";
-  return "project-wide";
-}
 
 async function askGemini(prompt, doc, options = {}) {
   try {
@@ -1111,7 +1072,7 @@ function formatStructuredSpreadsheetAnswer(text) {
 }
 
 async function analyzeDocument(doc, question, onProgress = () => {}, abortSignal, selectedSheet = null) {
-  const normalizedQuestion = question.trim().replace(/\s+/g, " ");
+  const normalizedQuestion = (doc.kind === "pdf" ? normalizePdfQuestion(question) : question).trim().replace(/\s+/g, " ");
   if(doc.kind==='spreadsheet'){
     const plan=planSpreadsheetQuestion(doc.sheets,normalizedQuestion,{selectedSheet});
     if(plan){
@@ -1135,7 +1096,7 @@ async function analyzeDocument(doc, question, onProgress = () => {}, abortSignal
   const localAnswer = doc.kind === "pdf"
     ? answerPdfLocally(doc, normalizedQuestion, { onDiagnostic: info => { localFailureReason = info.failureReason; } })
     : null;
-  if (localAnswer) {
+  if (localAnswer && !(doc.kind==='pdf' && classifyPdfQuestion(normalizedQuestion).intent==='division-performance' && /recommend|suggest|why|improve/i.test(normalizedQuestion))) {
     const source = doc.kind === "pdf" ? "local-pdf" : "local-spreadsheet";
     onProgress("Completed", { source });
     return { answer: localAnswer, source, cached: false };
@@ -1184,32 +1145,22 @@ async function performDocumentAnalysis(doc, normalizedQuestion, cacheKey, onProg
     return await performGeminiDocumentAnalysis(doc, normalizedQuestion, cacheKey, onProgress, abortSignal);
   } catch (error) {
     const pdfUnavailable=doc.kind==='pdf'&&(error.geminiNotConfigured||[401,403,429,503,504].includes(getHttpStatus(error))||error.geminiGroundingFailed);
-    if (!isDailyGeminiQuotaError(error)&&!pdfUnavailable) throw error;
+    if (!isDailyGeminiQuotaError(error)&&!error.appBudgetExceeded&&!pdfUnavailable) throw error;
     let localFailureReason = null;
     const answer = doc.kind === "pdf"
       ? answerPdfLocally(doc, normalizedQuestion, { forceSummary: true, onDiagnostic: info => { localFailureReason = info.failureReason; } })
       : answerLocally(doc.sheets, normalizedQuestion);
     const source = doc.kind === "pdf" ? "local-pdf" : "local-spreadsheet";
     const suggestions=doc.kind==='pdf'&&classifyPdfQuestion(normalizedQuestion).intent==='information-gaps'?missingInformationSuggestions(doc):null;
-    const message = suggestions
-      ? `Deeper Gemini analysis is unavailable${getHttpStatus(error)?` (provider status ${getHttpStatus(error)})`:''}. The following is a local analytical checklist, not the report's stated conclusions.\n\n${suggestions}`
-      : answer
-      ? `${answer}\n\n${isDailyGeminiQuotaError(error)?'Gemini daily limit reached':'Gemini analysis is unavailable'}; answered using local ${doc.kind === "pdf" ? "document analysis" : "spreadsheet calculations"}.`
-      : `${localLimitation(doc, localFailureReason)}${pdfUnavailable?' Deeper analysis is unavailable; unrelated retrieved passages have not been substituted.':''}`;
+    logGeminiError(error);
+    const providerMessage = error.geminiGroundingFailed ? "An additional explanation could not be verified against the document." : userFacingGeminiError(error);
+    const message = `${answer || suggestions || localLimitation(doc, localFailureReason)}\n\n${providerMessage}`;
     onProgress("Completed", { source, reason:pdfUnavailable?'gemini-analysis-unavailable':'gemini-daily-limit' });
     const deterministicFailure = doc.kind === "pdf" && (doc.extractionStatus === "ocr-required" || /insufficient-extracted-text|requested-page-has-no-extracted-text/.test(localFailureReason || ""));
-    return { answer: message, source, cached: false, retryable: !answer && !deterministicFailure,analysisUnavailable:pdfUnavailable||Boolean(suggestions) };
+    return { answer: message, source, cached: false, retryable: !answer && !deterministicFailure,analysisUnavailable:pdfUnavailable||Boolean(suggestions), providerError:{status:getHttpStatus(error),message:providerMessage} };
   }
 }
 
-function isDailyGeminiQuotaError(error) {
-  if (error?.appBudgetExceeded) return true;
-  if (getHttpStatus(error) !== 429) return false;
-  const details = getProviderErrorDetails(error);
-  const metadata = details.body?.details?.map(item => item?.metadata || {}).flat() || [];
-  const diagnostic = `${details.message || ""} ${JSON.stringify(metadata)}`;
-  return /daily|per.?day|requestsperday|quota exceeded/i.test(diagnostic);
-}
 
 async function performGeminiDocumentAnalysis(doc, normalizedQuestion, cacheKey, onProgress, abortSignal) {
   const modelTracker = { model: null };
@@ -1290,6 +1241,7 @@ async function performGeminiDocumentAnalysis(doc, normalizedQuestion, cacheKey, 
     if (structured) answer = formatStructuredSpreadsheetAnswer(answer);
   }
   if(doc.kind==='pdf'&&!pdfAnswerUsesKnownFigures(answer,doc))throw Object.assign(new Error('PDF response contains unsupported figures or page references.'),{geminiGroundingFailed:true});
+  if(doc.kind==='pdf'&&classifyPdfQuestion(normalizedQuestion).intent==='division-performance')answer = `${answerVerifiedPdfQuestion(doc,normalizedQuestion)}\n\n${answer}`;
   const source = modelTracker.model === FALLBACK_GEMINI_MODEL && FALLBACK_GEMINI_MODEL
     ? "gemini-fallback" : "gemini-primary";
   analysisCache.set(cacheKey, { answer, source, expiresAt: Date.now() + CACHE_TTL_MS });
@@ -1317,26 +1269,6 @@ function logGeminiError(error) {
   });
 }
 
-function userFacingGeminiError(error) {
-  const status = getHttpStatus(error);
-  if (error?.geminiNotConfigured) return error.message;
-  if (error?.appBudgetExceeded) return "TECHNOVALENS has reached its daily Gemini safety budget. Try a locally calculated question or continue tomorrow.";
-  if (error?.geminiQueueTimeout) return "The AI request waited too long in the Gemini queue. Please try again shortly.";
-  if (status === 504) return "Gemini timed out. Try a shorter PDF or ask for a more focused question.";
-  if (status === 503) return "Gemini is temporarily unavailable. Google reports high demand or service capacity issues; please try again shortly.";
-  if (status === 429) {
-    if (error?.geminiBothModelQuotasExhausted) return "The daily Gemini request quotas for both configured models are exhausted. Try again after the quota resets or use a project with available model quota.";
-    const providerMessage = getProviderErrorDetails(error).message || "";
-    return /daily|per day|billing|quota exceeded/i.test(providerMessage)
-      ? "The Gemini project quota is exhausted. Check the project's quota or billing settings before trying again."
-      : "Gemini is rate-limited. Please wait a moment and try again.";
-  }
-  if (status === 500) return "Gemini encountered an internal error. Please try again shortly.";
-  if (status === 401) return "Gemini authentication failed. Check the backend API key configuration.";
-  if (status === 403) return "Gemini access is forbidden. Check the API key permissions and model access.";
-  if (status === 400 || status === 404 || status === 422) return "Gemini rejected this request. Try a shorter question or document, and check that the configured model supports this request.";
-  return "Gemini could not analyse this file after retries. Please try again.";
-}
 
 async function validateQuestionRequest(req, res) {
   const { fileId, question, conversationId, selectedSheet = null } = req.body || {};

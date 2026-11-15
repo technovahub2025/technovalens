@@ -33,3 +33,63 @@ test('grounded PDF analysis rejects unsupported numbers, page references and fab
   assert.equal(pdfAnswerUsesKnownFigures('Orders: 930 [Page 99]',doc),false);
   const unverified={...doc,chunks:[text.replace(/^Page [12]$/gm,'')]};assert.doesNotMatch(answerVerifiedPdfQuestion(unverified,'How many total orders were recorded during Q2?')||'',/\[Page/);
 });
+import {getHttpStatus,isDailyGeminiQuotaError,userFacingGeminiError} from '../gemini-errors.js';
+import {normalizePdfQuestion} from '../pdf-questions.js';
+
+test('informal division questions use deterministic PDF values and comparisons',()=>{
+  for(const question of ['can you explain abt division performance','pls compare divisions','how are divisions doing?','Explain business division results']){
+    const answer=answerPdfLocally(doc,question);
+    assert.match(answer,/Technology Products: Q2 Revenue: 22,50,000; Share of Revenue: 46.4%; Gross Margin: 32%.*Page 1/);
+    assert.match(answer,/Professional Services: Q2 Revenue: 15,00,000; Share of Revenue: 30.9%; Gross Margin: 48%.*Page 1/);
+    assert.match(answer,/Accessories: Q2 Revenue: 11,00,000/);
+    assert.match(answer,/Calculated Q2 Revenue gap.*1,150,000.*Page 1/);
+    assert.match(answer,/23 percentage points.*Page 1/);
+    assert.match(answer,/Missing division metrics: profit/);
+    assert.doesNotMatch(answer,/Page 2|daily limit/);
+  }
+  assert.equal(normalizePdfQuestion('pls explain abt divisions'),'please explain about division');
+});
+
+test('division results are extracted rather than hardcoded and pages cannot be invented',()=>{
+  const changed={...doc,chunks:[text.replace(/Page 1/g,'Page 4').replace('n22,50,000','n10,00,000').replace('32%','52%')],pageCount:4};
+  const answer=answerPdfLocally(changed,'compare division performance');
+  assert.match(answer,/Q2 Revenue: Professional Services leads/);
+  assert.match(answer,/Gross Margin: Technology Products leads/);
+  assert.match(answer,/Page 4/);assert.doesNotMatch(answer,/Page 1/);
+  const unverified={...doc,chunks:[text.replace(/^Page [12]$/gm,'')]};
+  assert.doesNotMatch(answerPdfLocally(unverified,'explain division performance'),/\[Page/);
+  const missing={...doc,chunks:['Page 1\nBusiness overview\nThere is no segment table in this report.']};
+  assert.match(answerPdfLocally(missing,'explain abt division performance'),/does not contain an aligned division table/);
+  assert.match(answerPdfLocally(doc,'compare division performance on page 2'),/does not contain.*on page 2/);
+});
+
+test('provider authentication, limits, availability and timeout retain accurate safe diagnostics',()=>{
+  for(const [status,message] of [[401,/authentication failed/],[429,/rate-limited/],[503,/temporarily unavailable/],[504,/timed out/]]){
+    for(const error of [{status},{message:JSON.stringify({error:{code:status,message:'Test error'}})},{response:{status,data:{error:{code:status,message:'Test error'}}}}]){
+      assert.equal(getHttpStatus(error),status);assert.match(userFacingGeminiError(error),message);
+      assert.equal(isDailyGeminiQuotaError(error),false);assert.doesNotMatch(userFacingGeminiError(error),/daily|quota.*exhausted/);
+    }
+  }
+  assert.equal(getHttpStatus({name:'RequestTimeoutError'}),504);
+  assert.equal(isDailyGeminiQuotaError({status:429,message:JSON.stringify({error:{code:429,message:'Quota exceeded, requests per minute'}})}),false);
+  assert.equal(isDailyGeminiQuotaError({status:429,message:JSON.stringify({error:{code:429,message:'Daily quota exceeded'}})}),true);
+  assert.equal(isDailyGeminiQuotaError({status:429,appBudgetExceeded:true}),false);
+  assert.doesNotMatch(userFacingGeminiError({status:401,message:'secret-key-value'}),/secret-key-value/);
+});
+
+test('division table profits, missing values and equal results remain grounded',()=>{
+  const source={kind:'pdf',pageCount:7,chunks:['Page 7\nDivision Performance\nDivision Revenue Net Profit Gross Margin\nAlpha $1,200 $120 10%\nBeta $1,200 - 20%\nGamma $900 $90 10%']};
+  const answer=answerPdfLocally(source,'pls explain abt division performance');
+  assert.match(answer,/Alpha: Revenue: \$1,200; Net Profit: \$120/);
+  assert.match(answer,/Beta: Revenue: \$1,200; Net Profit: -/);
+  assert.match(answer,/Revenue: Alpha, Beta leads/);
+  assert.match(answer,/Net Profit: Alpha leads; Gamma/);
+  assert.match(answer,/Calculated Net Profit gap.*30.*Page 7/);
+  assert.doesNotMatch(answer,/Page [1-6]|Missing division metrics/);
+});
+
+test('division comparison never substitutes another reporting quarter',()=>{
+  assert.match(answerPdfLocally(doc,'explain division performance for Q1'),/does not contain.*for Q1/);
+  assert.doesNotMatch(answerPdfLocally(doc,'compare Q1 and Q2 division performance'),/Technology Products:/);
+  assert.match(answerPdfLocally(doc,'explain division performance for Q2'),/Technology Products:/);
+});

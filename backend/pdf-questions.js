@@ -1,11 +1,13 @@
+export const normalizePdfQuestion = value => String(value ?? '').replace(/\babt\b/gi,'about').replace(/\bpls\b/gi,'please').replace(/\bu\b/gi,'you').replace(/\bdivisions?\b/gi,'division');
 const normalize=value=>String(value??'').toLowerCase().replace(/[^\p{L}\p{N}%]+/gu,' ').trim().replace(/\s+/g,' ');
 const stop=new Set('what which how many much the a an are is was were of in from to this that report document information would help make better business decisions does provide recorded during total please explain compare'.split(' '));
 const terms=value=>normalize(value).split(' ').filter(word=>word.length>1&&!stop.has(word));
 const citation=page=>page?` [Page ${page}]`:' [extracted text; page unverified]';
 export function classifyPdfQuestion(question){
-  const q=String(question);
+  const q=normalizePdfQuestion(question);
   if(/\b(missing|information gaps?|not (?:included|covered)|additional (?:information|data)|what.{0,15}lacks?)\b/i.test(q))return {category:'recommendations',intent:'information-gaps',complex:true};
   if(/\brecommendations?\b/i.test(q)&&/\b(report|document|stated|provide|given|list|actual)\b/i.test(q)&&!/\b(your|you|would|suggest|should|additional)\b/i.test(q))return {category:'factual',intent:'stated-recommendations',complex:false};
+  if(/\bdivision\b/i.test(q)&&/\b(performance|results?|compare|comparison|versus|vs|doing|strongest|weakest|explain|about|recommend|suggest|why|improve)\b/i.test(q))return {category:"comparison",intent:"division-performance",complex:true};
   if(/\b(recommend|recommendations|suggest|should|better decisions)\b|\bhow.{0,25}improve\b/i.test(q))return {category:'recommendations',intent:'recommendations',complex:true};
   if(/\b(calculate|compute|sum|average|median|ratio|percentage change|difference between|increased? by|growth rate)\b/i.test(q))return {category:'calculation',intent:'calculation',complex:false};
   if(/\b(compare|comparison|versus|vs)\b/i.test(q))return {category:'comparison',intent:'comparison',complex:true};
@@ -19,7 +21,7 @@ export function pdfPages(doc){
   for(const chunk of doc.chunks||[]){let page=null;for(const line of String(chunk).split(/\r?\n/)){const marker=line.match(/^Page\s+(\d+)(?:\s*\(continued\))?\s*$/i);if(marker){page=+marker[1];if(page>doc.pageCount)page=null;}else if(line.trim())pages.set(page,`${pages.get(page)||''}\n${line.trim()}`.trim());}}
   return [...pages].map(([page,text])=>({page,text}));
 }
-const sectionHeading=line=>/^\d+(?:\.\d+)*[.)]\s+\S/.test(line)||/^(?:recommendations|conclusions?|executive summary|key findings)$/i.test(line.trim());
+const sectionHeading=line=>/^(?:revenue by (?:business )?division|(?:business )?division(?:s)? (?:performance|results))$/i.test(line.trim())||/^\d+(?:\.\d+)*[.)]\s+\S/.test(line)||/^(?:recommendations|conclusions?|executive summary|key findings)$/i.test(line.trim());
 function sections(doc){
   return pdfPages(doc).flatMap(({page,text})=>{
     const result=[];let current={page,title:'Extracted passage',lines:[]};
@@ -27,14 +29,14 @@ function sections(doc){
     return result;
   });
 }
-const numericToken='(?:₹|INR\\s*|Rs\\.?\\s*|[n$€£])?[+-]?\\d[\\d,]*(?:\\.\\d+)?%?|[—–]';
-const metricPattern=/\b(?:Q[1-4]\s+)?(?:average order value|share of revenue|gross margin|net profit margin|net profit|gross profit|operating expenses|revenue|orders|sales|costs|quantity|units)\b/gi;
+const numericToken='(?:\\u20b9|INR\\s*|Rs\\.?\\s*|[n$\\u20ac\\u00a3])?[+-]?\\d[\\d,]*(?:\\.\\d+)?%?|[\\u2014\\u2013-]';
+const metricPattern=/\b(?:Q[1-4]\s+)?(?:average order value|share of revenue|gross margin|net profit margin|net profit|gross profit|operating profit|profit|margin|operating expenses|revenue|orders|sales|costs|quantity|units)\b/gi;
 function tables(doc){
   const result=[];
   for(const section of sections(doc))for(let index=0;index<section.lines.length;index++){
     const header=section.lines[index],metrics=[...header.matchAll(metricPattern)].map(match=>match[0]);
     const periods=[...header.matchAll(/\b(?:Quarter\s+([1-4])(?:\s+\d{4})?|Q([1-4]))\b/gi)].map(match=>`Q${match[1]||match[2]}`);
-    const columns=periods.length>=2?periods:metrics;
+    const columns=periods.length>=2&&metrics.length<2?periods:metrics;
     if(columns.length<2)continue;
     const rows=[];
     for(const line of section.lines.slice(index+1)){
@@ -45,14 +47,16 @@ function tables(doc){
       if(values.length!==columns.length)break;
       rows.push({label:match[1].trim(),values,line});
     }
-    if(rows.length)result.push({page:section.page,title:section.title,columns,rows});
+    if(rows.length)result.push({page:section.page,title:section.title,header,columns,rows});
   }
   return result;
 }
 const metricMatch=(label,question)=>{const words=terms(label).filter(word=>!/^q[1-4]$/.test(word));return words.length&&words.every(word=>terms(question).includes(word));};
 export function answerVerifiedPdfQuestion(doc,question){
+  question=normalizePdfQuestion(question);
   const classification=classifyPdfQuestion(question),q=normalize(question),pageMatch=question.match(/\bpage\s+(\d+)\b/i);
   const allSections=sections(doc).filter(section=>!pageMatch||section.page===+pageMatch[1]);
+  if(classification.intent==='division-performance')return answerDivisionPerformance(doc,question);
   if(classification.intent==='stated-recommendations'){
     const selected=allSections.filter(section=>/recommend/i.test(section.title));
     if(!selected.length)return null;
@@ -134,4 +138,48 @@ export function pdfAnswerUsesKnownFigures(answer,doc){
   pages.filter(page=>page.page!=null).forEach(page=>known.add(String(page.page)));
   if(figures(answer).some(value=>!known.has(value)))return false;
   return [...String(answer).matchAll(/\bpage\s+(\d+)\b/gi)].every(match=>pages.some(page=>page.page===+match[1]));
+}
+
+
+// Only aligned numeric table rows are eligible for arithmetic. Prose is never
+// converted into division values, and tables from different periods stay separate.
+export function answerDivisionPerformance(doc, question) {
+  const requestedPage=question.match(/\bpage\s+(\d+)\b/i)?.[1];
+  const periods=value=>[...value.matchAll(/\b(?:Q|Quarter\s+)([1-4])\b/gi)].map(match=>match[1]);
+  const requestedPeriods=periods(question);
+  const matchesPeriod=table=>{
+    const labeled=periods(`${table.title} ${table.header}`);
+    const preamble=pdfPages(doc).find(page=>page.page===table.page)?.text.split(/\n\d+[.)]\s/)[0]||'';
+    const available=labeled.length?labeled:periods(preamble);
+    return requestedPeriods.every(period=>available.includes(period));
+  };
+  const candidates=tables(doc).filter(table=>(!requestedPage||table.page===+requestedPage)
+    && /\bdivisions?\b/i.test(`${table.title} ${table.header}`)
+    && table.columns.some(c=>/revenue|profit|margin/i.test(c)) && matchesPeriod(table));
+  if(!candidates.length)return 'The extracted PDF does not contain an aligned division table with division names and revenue, profit or margin values'+(requestedPage?` on page ${requestedPage}`:'')+(requestedPeriods.length?` for ${requestedPeriods.map(period=>`Q${period}`).join(' and ')}`:'')+'. A reliable division comparison needs those figures and their reporting period; no division results have been inferred.';
+  const number=value=>/\d/.test(value)?Number(value.replace(/[^\d.+-]/g,'')):null;
+  const output=[];
+  for(const table of candidates){
+    const rows=table.rows.filter(row=>! /^(total|overall|all divisions)$/i.test(row.label));
+    if(!rows.length)continue;
+    const clean=value=>value.replace(/^n(?=\d)/,'');
+    const lines=rows.map(row=>`- ${row.label}: ${table.columns.map((column,i)=>`${column}: ${clean(row.values[i])}`).join('; ')}.${citation(table.page)}`);
+    const comparisons=[];
+    for(const [i,column] of table.columns.entries()){
+      if(!/revenue|profit|margin/i.test(column)||/share/i.test(column))continue;
+      const valid=rows.map(row=>({row,value:number(row.values[i])})).filter(item=>item.value!==null&&Number.isFinite(item.value));
+      if(valid.length<2)continue;
+      const high=Math.max(...valid.map(item=>item.value)),low=Math.min(...valid.map(item=>item.value));
+      const names=value=>valid.filter(item=>item.value===value).map(item=>item.row.label).join(', ');
+      comparisons.push(`${column}: ${names(high)} ${high===low?'ties with all compared divisions':`leads; ${names(low)} has the lowest reported value`}.${citation(table.page)}`);
+      if(high!==low){
+        const spread=high-low;
+        comparisons.push(`Calculated ${column} gap between highest and lowest: ${Number(spread.toFixed(6)).toLocaleString('en-US',{maximumFractionDigits:6})}${/margin/i.test(column)&&valid.every(item=>item.row.values[i].endsWith('%'))?' percentage points':" (in the table's reported units)"}.${citation(table.page)}`);
+      }
+    }
+    const missing=['revenue','profit','margin'].filter(metric=>!table.columns.some(c=>new RegExp(`\\b${metric}\\b`,'i').test(c)));
+    output.push(`${table.title}:\n${lines.join('\n')}\n\n${comparisons.join('\n')}\n\nRevenue indicates sales scale; margin indicates profitability per unit of sales. Lower revenue or margin is a relative weakness on that measure, not proof of poor overall performance. ${missing.length?`Missing division metrics: ${missing.join(', ')}. `:''}The table alone does not establish causes, allocated costs or future performance.${citation(table.page)}`);
+    if(rows.some(row=>row.values.some(value=>/^n\d/.test(value))))output.push("The currency symbol is unreadable in the extracted text; amounts retain the report's units.");
+  }
+  return output.join('\n\n')||null;
 }

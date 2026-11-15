@@ -29,3 +29,18 @@ Tests use the original **TECHNOVALENS_Sample_Business_Report.pdf** copied into `
 No live Gemini requests were needed for regression tests. Model output quality beyond the strict grounding checks has been exercised with a local provider stub rather than a live production key. Arbitrary PDF layouts without a recognized unambiguous table/header/period remain conservative: use relevant source quotations or ask for structured data instead of guessing a figure. Qualitative analysis is labeled as inference, not promoted to source truth.
 
 Source page renders are under `.data/pdf-chat-validation/`. `node inspect-pdf-text.mjs path/to/report.pdf` reproduces extraction and renders; the optional `--fixture` explicitly refreshes the local text fixture. No production resources were changed, and nothing was committed, pushed or deployed.
+
+
+## Division analysis update - 15 November 2026
+
+The question "can you explain abt division performance" previously entered the complex-reasoning path, which bypassed local PDF tables. Its generic fallback conflated provider failures with daily limits. The original incident's provider response is not retained in this workspace; its exact historical status cannot be established from the reported message. No live production request was made to guess it.
+
+Informal queries now normalize `abt`, `pls`, `u` and division plurals. Division comparisons read aligned table headers and numeric rows, keep periods and pages separate, report source revenue/profit/margins, rank available values (including ties), and calculate highest-to-lowest gaps. Missing figures stay missing; missing profit is not derived from gross margin. Unreadable currency symbols are disclosed. Unsupported layouts return a precise extraction limitation instead of unrelated excerpts.
+
+For the sample fixture, Technology Products leads Q2 revenue; Professional Services leads gross margin; Accessories has the lowest revenue and margin. The verified revenue gap is 1,150,000 in the report's units and gross-margin gap is 23 percentage points, both cited to Page 1. Division profit is absent from that table. Questions requesting Q1 division values cannot silently receive Q2 values.
+
+Requests for deeper reasons or recommendations compute the table comparison first, then use grounded qualitative Gemini analysis. Provider failures preserve the comparison and show the specific safe error. Status/body parsing is shared in `gemini-errors.js`; HTTP 401, 429, 503 and 504 remain distinct. Daily quota detection requires provider daily-quota evidence, and the application's safety budget remains a separate condition. Fallback diagnostics are logged even when the HTTP response successfully contains a local answer. Source labels in chat use readable document/calculation labels; saved conversation storage is unchanged.
+
+Regression coverage includes the actual binary PDF upload, informal questions, altered figures and rankings, ties, missing profit values, reporting-period selection, page restrictions/unverified pages, mock provider errors and private workspace/history behavior. Validation uses a temporary MongoDB and local provider stub, with no production data changes. The frontend build uses the temporary `VITE_API_URL=https://api.example.com` solely to satisfy the existing HTTPS production-build guard; the artifact is not deployed.
+
+Final validation: the full backend run passed 98/98 tests; the final focused PDF/provider tests passed 9/9, including the added reporting-quarter regression. The frontend production build passed with the existing bundle-size warning. Logs: `validation-pdf-assistant-tests.log` and `validation-pdf-unit-tests.log` (ignored local validation artifacts).

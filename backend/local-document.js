@@ -1,4 +1,4 @@
-import {classifyPdfQuestion,answerVerifiedPdfQuestion} from './pdf-questions.js';
+import {classifyPdfQuestion,answerVerifiedPdfQuestion,normalizePdfQuestion} from './pdf-questions.js';
 
 const STOP_WORDS = new Set((
   "a about above after again against all am an and any are as at be because been before being below between both but by can could did do does doing down during each few for from further had has have having he her here hers herself him himself his how i if in into is it its itself just me more most my myself no nor not of off on once only or other our ours ourselves out over own same she should so some such than that the their theirs them themselves then there these they this those through to too under until up very was we were what when where which while who whom why will with would you your yours " +
@@ -162,7 +162,7 @@ export function answerPdfLocally(doc, question, { forceSummary = false, onDiagno
   const info = extractionInfo(doc, pages);
   const sentences = sentencesFrom(pages);
   const headings = headingsFrom(pages);
-  const q = String(question || "").trim();
+  const q = normalizePdfQuestion(question).trim();
   const queryTerms = termsOf(q);
   const pageMatch = q.match(/\bpage\s+(\d+)\b/i);
   const pageNumber = pageMatch ? Number(pageMatch[1]) : null;
@@ -271,6 +271,6 @@ export function localLimitation(doc, failureReason = "") {
     return "This PDF appears to be scanned or contains too little selectable text. OCR is required before local document analysis can answer questions; no answer was generated.";
   }
   return doc.kind === "pdf"
-    ? "Gemini is unavailable or its daily limit has been reached. Local document analysis could not find enough relevant extracted text to answer reliably. Try a question using terms from the document or retry when Gemini is available."
-    : "Gemini is unavailable or its daily limit has been reached. This request needs analysis beyond the spreadsheet calculations available locally, so I can’t answer it reliably right now.";
+    ? "The extracted PDF does not provide enough relevant evidence to answer this question reliably. Please identify the metric, division or reporting period needed, or provide a document containing that information."
+    : "This request needs analysis beyond the spreadsheet calculations available locally, so I can’t answer it reliably right now.";
 }

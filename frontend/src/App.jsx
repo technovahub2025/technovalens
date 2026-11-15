@@ -69,11 +69,11 @@ function apiErrorMessage(error, fallback = "The request could not be completed."
 
   if (status === 429) {
     if(response?.data?.code==='PARSER_BUSY')return message||'Spreadsheet processing is busy. Please retry shortly.';
-    return "Gemini is rate-limited. Please wait a moment and try again.";
+    return message || "Gemini is rate-limited. Please wait a moment and try again.";
   }
 
   if (status === 503) {
-    return "Gemini is temporarily unavailable. Please try again shortly.";
+    return message || "Gemini is temporarily unavailable. Please try again shortly.";
   }
 
   if ([400, 404, 422].includes(status)) {
@@ -89,7 +89,7 @@ function apiErrorMessage(error, fallback = "The request could not be completed."
   }
 
   if (status >= 500) {
-    return `TECHNOVALENS backend error (HTTP ${status}). Check Render logs.`;
+    return message || "The service could not complete this request. Please try again shortly.";
   }
 
   if (
@@ -930,10 +930,10 @@ export default function App({authUser,onLogout,onManageRecovery}) {
   // =====================================================
 
   const sourceLabels = {
-    "local-pdf": "Local document engine",
-    "local-spreadsheet": "Local spreadsheet engine",
-    "gemini-primary": "Gemini primary model",
-    "gemini-fallback": "Gemini fallback model",
+    "local-pdf": "Document evidence",
+    "local-spreadsheet": "Spreadsheet calculations",
+    "gemini-primary": "Document analysis",
+    "gemini-fallback": "Document analysis",
     local: "Calculated locally",
     gemini: "Gemini answer"
   };

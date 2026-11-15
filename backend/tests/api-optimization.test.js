@@ -29,6 +29,7 @@ const providerServer = createServer(async (req, res) => {
   try { requestBody = JSON.parse(Buffer.concat(requestParts).toString("utf8")); mock.lastPrompt = requestBody.contents?.[0]?.parts?.[0]?.text || ""; }
   catch { mock.lastPrompt = ""; }
   mock.lastMime = requestBody?.generationConfig?.responseMimeType || null;
+  if(mock.mode==='504'){res.writeHead(504,{'content-type':'application/json'}).end(JSON.stringify({error:{code:504,status:'DEADLINE_EXCEEDED',message:'Request timed out.'}}));mock.active--;return;}
   if(mock.mode==='401'){res.writeHead(401,{'content-type':'application/json'}).end(JSON.stringify({error:{code:401,status:'UNAUTHENTICATED',message:'Test authentication error.'}}));mock.active--;return;}
   if (mock.delayMs) await new Promise(resolve => setTimeout(resolve, mock.delayMs));
   const finish = () => { mock.active--; };
@@ -327,7 +328,7 @@ test("Excel API caching, single-flight, 429/503 retries, local answers and persi
     const quotaBody = await quotaResponse.json();
     assert.equal(quotaResponse.status, 200);
     assert.equal(quotaBody.source, "local-spreadsheet");
-    assert.match(quotaBody.answer, /Gemini is unavailable or its daily limit has been reached/i);
+    assert.match(quotaBody.answer, /Gemini.*quota.*exhausted/i);
     assert.equal(mock.calls - before429, 1, "daily quota errors are not retried");
 
     mock.mode = "429rate";
@@ -386,7 +387,7 @@ test("application daily budget blocks provider calls but local analytics continu
     const exhaustedBody = await exhausted.json();
     assert.equal(exhausted.status, 200);
     assert.equal(exhaustedBody.source, "local-spreadsheet");
-    assert.match(exhaustedBody.answer, /daily limit has been reached|can’t answer it reliably/i);
+    assert.match(exhaustedBody.answer, /daily Gemini safety budget/i);
     assert.equal(exhaustedBody.retryable, true);
     assert.equal(mock.calls, 1);
     const local = await ask(running.base, workbook.fileId, "What is the total Revenue?");
@@ -469,7 +470,7 @@ test("local PDF summaries, key points, page retrieval, quota recovery, and Excel
 
     const unknown = await (await ask(running.base, pdf.fileId, "Develop a detailed geopolitical forecast for the next decade.")).json();
     assert.equal(unknown.source, "local-pdf");
-    assert.match(unknown.answer, /could not find enough relevant extracted text|couldn’t find enough relevant text/i);
+    assert.match(unknown.answer, /extracted PDF does not provide enough relevant evidence/i);
     assert.doesNotMatch(unknown.answer, /geopolitical forecast will/i);
     assert.equal(unknown.retryable, true);
 
@@ -532,7 +533,7 @@ test("provider daily quota returns grounded local limitation without invented an
     const body = await response.json();
     assert.equal(response.status, 200);
     assert.equal(body.source, "local-pdf");
-    assert.match(body.answer, /Gemini.*daily limit.*could not find enough relevant extracted text/i);
+    assert.match(body.answer, /extracted PDF.*enough relevant evidence[\s\S]*Gemini.*quota.*exhausted/i);
     assert.equal(body.retryable, true);
     assert.equal(mock.calls, 1);
   } finally {
@@ -658,15 +659,15 @@ test('actual sample PDF lookup, missing-information analysis, provider failures 
     const form=new FormData();form.append('file',new Blob([await readFile(new URL('./fixtures/sample-business-report.pdf',import.meta.url))],{type:'application/pdf'}),'sample-business-report.pdf');
     const response=await fetch(`${running.base}/api/files/upload`,{method:'POST',body:form});assert.equal(response.status,200);const pdf=await response.json();
     const before=mock.calls;
-    for(const [question,expected] of [['How many total orders were recorded during Q2?',/930.*Page 1/],['Which business division had the highest gross margin?',/Professional Services: 48%.*Page 1/],['What recommendations does the report provide?',/Increase marketing investment.*Page 2/],['Compare Q1 and Q2 net profit',/6,30,000 versus Q2: n?8,25,000.*Page 2/]]){
+    for(const [question,expected] of [['can you explain abt division performance',/Technology Products[\s\S]*Professional Services[\s\S]*23 percentage points.*Page 1/],['How many total orders were recorded during Q2?',/930.*Page 1/],['Which business division had the highest gross margin?',/Professional Services: 48%.*Page 1/],['What recommendations does the report provide?',/Increase marketing investment.*Page 2/],['Compare Q1 and Q2 net profit',/6,30,000 versus Q2: n?8,25,000.*Page 2/]]){
       const answer=await (await ask(running.base,pdf.fileId,question)).json();assert.equal(answer.source,'local-pdf');assert.match(answer.answer,expected);
     }
     assert.equal(mock.calls,before,'verified table and recommendations lookups make no provider requests');
     const question='What information is missing from this report?';
     const analysis=await (await ask(running.base,pdf.fileId,question)).json();assert.equal(analysis.source,'gemini-primary');assert.match(analysis.answer,/Analytical suggestions \(not facts stated/);assert.match(analysis.answer,/retention.*profitability.*marketing ROI.*regional sales.*cash flow.*forecasts/);
     assert.match(mock.lastPrompt,/PDF_GROUNDED_ANALYSIS/);assert.match(mock.lastPrompt,/Page 1/);assert.doesNotMatch(analysis.answer,/delivered a positive Quarter/);
-    for(const [index,mode] of ['401','429daily','503'].entries()){
-      mock.mode=mode;const unavailable=await (await ask(running.base,pdf.fileId,`${question} Focus request ${index}.`)).json();assert.equal(unavailable.source,'local-pdf');assert.equal(unavailable.analysisUnavailable,true);assert.match(unavailable.answer,/Deeper Gemini analysis is unavailable/);assert.match(unavailable.answer,/Analytical suggestions/);assert.doesNotMatch(unavailable.answer,/delivered a positive Quarter/);
+    for(const [index,mode] of ['401','429daily','429rate','503','504'].entries()){
+      mock.mode=mode;const unavailable=await (await ask(running.base,pdf.fileId,`${question} Focus request ${index}.`)).json();assert.equal(unavailable.source,'local-pdf');assert.equal(unavailable.analysisUnavailable,true);assert.equal(unavailable.providerError.status,mode==='429daily'||mode==='429rate'?429:Number(mode));if(mode!=='429daily')assert.doesNotMatch(unavailable.answer,/daily|quota.*exhausted/i);assert.match(unavailable.answer,/Gemini (authentication failed|project quota is exhausted|is temporarily unavailable|timed out|is rate-limited)/);assert.match(unavailable.answer,/Analytical suggestions/);assert.doesNotMatch(unavailable.answer,/delivered a positive Quarter/);
       const verified=await (await ask(running.base,pdf.fileId,'How many total orders were recorded during Q2?')).json();assert.match(verified.answer,/930.*Page 1/);
     }
     const denied=await fetch(`${running.base}/api/ai/ask`,{method:'POST',headers:{'content-type':'application/json','X-Workspace-Token':'2'.repeat(64)},body:JSON.stringify({fileId:pdf.fileId,question})});assert.equal(denied.status,404);
@@ -708,14 +709,14 @@ test("PDF primary/fallback generation, quota routing, chunking, recovery and Exc
     const beforeProjectQuota = mock.calls;
     const projectQuotaResponse = await ask(running.base, pdf.fileId, "Assess strategic risks with project quota exhausted.");
     assert.equal(projectQuotaResponse.status, 200);
-    assert.match((await projectQuotaResponse.json()).answer, /Gemini is unavailable or its daily limit has been reached/i);
+    assert.match((await projectQuotaResponse.json()).answer, /Gemini.*quota.*exhausted/i);
     assert.equal(mock.calls - beforeProjectQuota, 1, "project-wide quota should not trigger fallback or retries");
 
     mock.mode = "429-both-daily";
     const beforeBothQuota = mock.calls;
     const bothQuotaResponse = await ask(running.base, pdf.fileId, "Assess strategic risks with both model quotas exhausted.");
     assert.equal(bothQuotaResponse.status, 200);
-    assert.match((await bothQuotaResponse.json()).answer, /Gemini is unavailable or its daily limit has been reached/i);
+    assert.match((await bothQuotaResponse.json()).answer, /Gemini.*quota.*exhausted/i);
     assert.equal(mock.calls - beforeBothQuota, 2, "each model-specific daily quota is tried once");
 
     mock.mode = "503-primary";
@@ -739,7 +740,7 @@ test("PDF primary/fallback generation, quota routing, chunking, recovery and Exc
     const beforeBothFail = mock.calls;
     const bothUnavailable = await ask(running.base, pdf.fileId, failedQuestion);
     assert.equal(bothUnavailable.status, 200);
-    assert.match((await bothUnavailable.json()).answer, /Deeper analysis is unavailable/i);
+    assert.match((await bothUnavailable.json()).answer, /Gemini is temporarily unavailable/i);
     assert.equal(mock.calls - beforeBothFail, 6, "primary and fallback each get no more than two retries");
 
     mock.mode = "success";
